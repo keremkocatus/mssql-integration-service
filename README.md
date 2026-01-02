@@ -106,7 +106,7 @@ POST /api/datatransfer/transfer
 {
     "source": {
         "connectionString": "Server=source-server;Database=SourceDB;User Id=sa;Password=xxx;TrustServerCertificate=true;",
-        "query": "SELECT Id, Name, Email FROM Users WHERE CreatedAt > '2024-01-01'"
+        "query": "SELECT Id, Name, Email FROM Users WHERE CreatedAt > '2025-01-01'"
     },
     "target": {
         "connectionString": "Server=target-server;Database=TargetDB;User Id=sa;Password=xxx;TrustServerCertificate=true;",
@@ -246,11 +246,44 @@ POST /api/dynamicquery/database-info
 {
   "ConnectionStrings": {
     "DefaultConnection": "Server=localhost;Database=MyDB;User Id=sa;Password=xxx;TrustServerCertificate=true;"
+  },
+  "RequestLogging": {
+    "Enabled": true,
+    "LogRequestBody": true,
+    "LogResponseBody": false,
+    "ExcludePaths": ["/api/health", "/swagger"],
+    "Console": {
+      "Enabled": true,
+      "UseColors": true
+    },
+    "File": {
+      "Enabled": false,
+      "Directory": "logs",
+      "Format": "json",
+      "RollingInterval": "Daily"
+    },
+    "MongoDB": {
+      "Enabled": false,
+      "ConnectionString": "mongodb://localhost:27017",
+      "DatabaseName": "MssqlIntegrationService",
+      "CollectionName": "RequestLogs"
+    }
   }
 }
 ```
 
 > **Note:** DefaultConnection is optional. You can use dynamic endpoints without configuring a default connection.
+
+### Request Logging Options
+| Option | Description | Default |
+|--------|-------------|---------|
+| `Enabled` | Enable/disable request logging | `true` |
+| `LogRequestBody` | Log request body content | `true` |
+| `LogResponseBody` | Log response body content | `false` |
+| `ExcludePaths` | Paths to exclude from logging | `[]` |
+| `Console.Enabled` | Enable console logging | `true` |
+| `File.Enabled` | Enable file logging | `false` |
+| `MongoDB.Enabled` | Enable MongoDB logging | `false` |
 
 ## 🐳 Docker Support
 
@@ -258,10 +291,10 @@ POST /api/dynamicquery/database-info
 
 ```bash
 # Build image
-docker build -t mssql-generic-service .
+docker build -t mssql-integration-service .
 
 # Run container
-docker run -d -p 5000:8080 --name mssql-service mssql-generic-service
+docker run -d -p 5000:8080 --name mssql-service mssql-integration-service
 ```
 
 ### Docker Compose (with SQL Server)
