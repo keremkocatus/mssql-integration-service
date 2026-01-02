@@ -52,3 +52,37 @@ CodeCoverage/
 *.VisualState.xml
 TestResult.xml
 nunit-*.xml
+
+# Visual Studio
+.vs/
+*.user
+*.userosscache
+*.suo
+*.cache
+
+# Rider
+.idea/
+
+# VS Code (optional)
+# .vscode/
+
+# Docker
+docker-compose.override.yml
+
+# Local env files
+appsettings.local.json
+appsettings.Development.json
+*.env
+.env*
+
+# Secrets
+secrets/
+*.pfx
+*.p12
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# macOS
+.DS_Store
