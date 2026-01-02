@@ -13,6 +13,8 @@ A comprehensive MSSQL integration service built with .NET 9 and Clean Architectu
 - ✅ **Data sync** (Delete-Insert pattern)
 - ✅ **Bulk insert** operations
 - ✅ **Request logging** (Console, File, MongoDB)
+- ✅ **Sensitive data masking** (connection strings, passwords in logs)
+- ✅ **Custom exception handling** (ValidationException, NotFoundException, DatabaseException)
 - ✅ SQL Injection protection
 - ✅ Database info & schema discovery
 - ✅ Connection testing
@@ -339,6 +341,33 @@ dotnet test --collect:"XPlat Code Coverage"
 dotnet test tests/MssqlIntegrationService.Tests
 ```
 
-## 📜 License
+## � Security Features
+
+### Sensitive Data Masking
+Request logging automatically masks sensitive data in JSON payloads:
+- `connectionString` - Password portion is masked
+- `password`, `pwd`, `secret`, `token`, `apiKey` - Fully masked
+
+**Example masked log:**
+```json
+{
+  "connectionString": "Server=myserver;Database=MyDB;Password=*** MASKED ***;",
+  "query": "SELECT * FROM Users"
+}
+```
+
+### Custom Exception Handling
+The API returns appropriate HTTP status codes based on exception types:
+
+| Exception | HTTP Status | Description |
+|-----------|-------------|-------------|
+| `ValidationException` | 400 Bad Request | Invalid input data |
+| `NotFoundException` | 404 Not Found | Resource not found |
+| `DatabaseException` | 503 Service Unavailable | Database connection/operation failed |
+| Other exceptions | 500 Internal Server Error | Unexpected errors |
+
+> **Note:** In production, internal error details are hidden for security.
+
+## �📜 License
 
 MIT

@@ -70,7 +70,8 @@ public class RequestLoggingMiddleware
         // Read request body if enabled
         if (_options.LogRequestBody && context.Request.ContentLength > 0)
         {
-            log.RequestBody = await ReadRequestBodyAsync(context);
+            var rawBody = await ReadRequestBodyAsync(context);
+            log.RequestBody = MaskSensitiveJson(rawBody);
         }
 
         // Replace response body stream to capture response
@@ -208,6 +209,115 @@ public class RequestLoggingMiddleware
         };
 
         return sensitiveHeaders.Contains(headerName, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static string? MaskSensitiveJson(string? json)
+    {
+        try
+        {
+            if (string.IsNullOrWhiteSpace(json)) return json;
+
+            // Simple check if it looks like JSON
+            var trimmed = json.TrimStart();
+            if (!trimmed.StartsWith("{") && !trimmed.StartsWith("["))
+                return json;
+
+            var jsonNode = System.Text.Json.Nodes.JsonNode.Parse(json);
+            if (jsonNode == null) return json;
+
+            MaskNode(jsonNode);
+
+            return jsonNode.ToString();
+        }
+        catch
+        {
+            // If parsing fails, return original
+            return json;
+        }
+    }
+
+    private static void MaskNode(System.Text.Json.Nodes.JsonNode node)
+    {
+        if (node is System.Text.Json.Nodes.JsonObject obj)
+        {
+            // Create a list of keys to avoid modification during iteration issues
+            var keys = obj.Select(x => x.Key).ToList();
+            foreach (var key in keys)
+            {
+                if (IsSensitiveProperty(key))
+                {
+                    var value = obj[key]?.ToString();
+                    // If it looks like a connection string, mask the password part
+                    if (value != null && IsConnectionString(value))
+                    {
+                        obj[key] = MaskConnectionString(value);
+                    }
+                    else
+                    {
+                        obj[key] = "*** MASKED ***";
+                    }
+                }
+                else if (obj[key] != null)
+                {
+                    MaskNode(obj[key]!);
+                }
+            }
+        }
+        else if (node is System.Text.Json.Nodes.JsonArray arr)
+        {
+            foreach (var item in arr)
+            {
+                if (item != null)
+                {
+                    MaskNode(item);
+                }
+            }
+        }
+    }
+
+    private static bool IsSensitiveProperty(string name)
+    {
+        var sensitive = new[] 
+        { 
+            "connectionString", 
+            "password", 
+            "pwd", 
+            "token", 
+            "secret", 
+            "apiKey",
+            "access_token",
+            "client_secret"
+        };
+        return sensitive.Contains(name, StringComparer.OrdinalIgnoreCase);
+    }
+
+    private static bool IsConnectionString(string value)
+    {
+        // Check if value looks like a connection string
+        return value.Contains("Server=", StringComparison.OrdinalIgnoreCase) ||
+               value.Contains("Data Source=", StringComparison.OrdinalIgnoreCase) ||
+               value.Contains("mongodb://", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static string MaskConnectionString(string connectionString)
+    {
+        // Mask password in connection strings
+        // Handles: Password=xxx; Pwd=xxx; password=xxx
+        var result = System.Text.RegularExpressions.Regex.Replace(
+            connectionString,
+            @"(Password|Pwd)\s*=\s*[^;]+",
+            "$1=*** MASKED ***",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+        // Mask MongoDB password in URI format: mongodb://user:password@host
+        // Use non-greedy match and look for the last @ before host
+        result = System.Text.RegularExpressions.Regex.Replace(
+            result,
+            @"(mongodb(?:\+srv)?://[^:]+:)([^@]+)(@[^/]+)",
+            "$1*** MASKED ***$3",
+            System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+
+        return result;
     }
 }
 
