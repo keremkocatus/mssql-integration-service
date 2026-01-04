@@ -237,7 +237,7 @@ public class DataSyncService : IDataSyncService
         foreach (var col in columns)
         {
             var targetColName = columnMappings?.GetValueOrDefault(col.ColumnName) ?? col.ColumnName;
-            var sqlType = GetSqlType(col.DataType);
+            var sqlType = GetSqlTypeWithMetadata(col);
             columnDefs.Add($"    [{targetColName}] {sqlType} NULL");
         }
 
@@ -247,24 +247,28 @@ public class DataSyncService : IDataSyncService
         return sb.ToString();
     }
 
-    private static string GetSqlType(Type type)
+    /// <summary>
+    /// Gets SQL type with metadata from DataColumn (MaxLength for strings).
+    /// </summary>
+    private static string GetSqlTypeWithMetadata(DataColumn col)
     {
-        var underlyingType = Nullable.GetUnderlyingType(type) ?? type;
+        var type = Nullable.GetUnderlyingType(col.DataType) ?? col.DataType;
         
-        return underlyingType.Name switch
+        return type.Name switch
         {
+            "String" when col.MaxLength > 0 && col.MaxLength < 4000 => $"NVARCHAR({col.MaxLength})",
             "String" => "NVARCHAR(MAX)",
             "Int32" => "INT",
             "Int64" => "BIGINT",
             "Int16" => "SMALLINT",
             "Byte" => "TINYINT",
             "Boolean" => "BIT",
-            "DateTime" => "DATETIME2",
+            "DateTime" => "DATETIME", // Default to DATETIME for compatibility
             "DateTimeOffset" => "DATETIMEOFFSET",
             "DateOnly" => "DATE",
             "TimeOnly" => "TIME",
             "TimeSpan" => "TIME",
-            "Decimal" => "DECIMAL(18,4)",
+            "Decimal" => "DECIMAL(38,18)", // Max precision for temp table to avoid truncation
             "Double" => "FLOAT",
             "Single" => "REAL",
             "Guid" => "UNIQUEIDENTIFIER",

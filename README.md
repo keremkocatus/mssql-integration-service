@@ -45,7 +45,7 @@ src/
 └── MssqlIntegrationService.API/              # API layer (controllers, middleware)
 
 tests/
-└── MssqlIntegrationService.Tests/            # Unit tests (124 tests)
+└── MssqlIntegrationService.Tests/            # Unit tests (148 tests)
 ```
 
 ## 🏗️ Architecture
@@ -78,6 +78,25 @@ All ETL operations use **streaming** to avoid loading entire datasets into memor
 | DataSync | `List<T>` buffer | Temp table + streaming |
 | MongoToMssql | `ToListAsync()` | `IAsyncCursor` + `BsonDocumentDataReader` |
 | BulkInsert | Array to DataTable | `ObjectDataReader` streaming |
+
+### SQL Type Mapping
+
+When creating tables dynamically, the system uses **source schema metadata** for accurate type mapping:
+
+| Source Type | SQL Server Type | Notes |
+|-------------|-----------------|-------|
+| `varchar`, `char`, `text` | `VARCHAR(n)` | Preserves original length from schema |
+| `nvarchar`, `nchar`, `ntext`, string | `NVARCHAR(n)` | Unicode support, default for strings |
+| `datetime`, `datetime2`, `smalldatetime` | Same as source | Preserves datetime variant |
+| `decimal`, `numeric` | `DECIMAL(p,s)` | Uses original precision/scale from schema |
+| `int`, `bigint`, `smallint`, etc. | Same as source | Direct mapping |
+| MongoDB `Decimal128` | `DECIMAL(38,18)` | Max precision for MongoDB decimals |
+
+**Key Features:**
+- **VARCHAR vs NVARCHAR**: Detected from `DataTypeName` in schema (not assumed)
+- **DateTime**: Preserves source type (DATETIME, DATETIME2, SMALLDATETIME)
+- **Decimal precision**: Uses `NumericPrecision` and `NumericScale` from schema
+- **Column size**: Uses `ColumnSize` from schema for string lengths
 
 ## 🏃‍♂️ Running the Service
 

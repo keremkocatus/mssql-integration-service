@@ -273,24 +273,76 @@ public class DataTransferService : IDataTransferService
         for (int i = 0; i < columns.Count; i++)
         {
             var col = columns[i];
-            var sqlType = GetSqlType(col.DataType);
+            var baseSqlType = GetSqlType(col.DataType);
 
-            if (schemaTable != null)
+            if (schemaTable != null && i < schemaTable.Rows.Count)
             {
                 var schemaRow = schemaTable.Rows[i];
                 var maxLength = schemaRow["ColumnSize"] as int? ?? 0;
                 var isNullable = schemaRow["AllowDBNull"] as bool? ?? true;
+                var precision = schemaRow["NumericPrecision"] as short? ?? schemaRow["NumericPrecision"] as int? ?? 0;
+                var scale = schemaRow["NumericScale"] as short? ?? schemaRow["NumericScale"] as int? ?? 0;
+                var dataTypeName = schemaRow["DataTypeName"] as string ?? "";
 
-                if (sqlType == "NVARCHAR" || sqlType == "VARCHAR")
+                var sqlType = baseSqlType;
+
+                // Handle string types - detect VARCHAR vs NVARCHAR from source
+                if (baseSqlType == "NVARCHAR")
                 {
-                    sqlType = maxLength > 0 && maxLength < 8000 ? $"{sqlType}({maxLength})" : $"{sqlType}(MAX)";
+                    // Check if source is actually VARCHAR (not unicode)
+                    var isVarchar = dataTypeName.Equals("varchar", StringComparison.OrdinalIgnoreCase) ||
+                                    dataTypeName.Equals("char", StringComparison.OrdinalIgnoreCase) ||
+                                    dataTypeName.Equals("text", StringComparison.OrdinalIgnoreCase);
+                    
+                    var baseType = isVarchar ? "VARCHAR" : "NVARCHAR";
+                    
+                    // Use ColumnSize from schema - negative or very large means MAX
+                    sqlType = maxLength > 0 && maxLength <= 8000 ? $"{baseType}({maxLength})" : $"{baseType}(MAX)";
+                }
+                // Handle decimal/numeric with precision and scale from source
+                else if (baseSqlType == "DECIMAL")
+                {
+                    var p = precision > 0 ? precision : 18;
+                    var s = scale >= 0 ? scale : 4;
+                    sqlType = $"DECIMAL({p},{s})";
+                }
+                // Handle datetime types - check if source is datetime2
+                else if (baseSqlType == "DATETIME")
+                {
+                    // Check if source is datetime2 (has fractional seconds precision)
+                    if (dataTypeName.Equals("datetime2", StringComparison.OrdinalIgnoreCase))
+                    {
+                        sqlType = scale > 0 && scale <= 7 ? $"DATETIME2({scale})" : "DATETIME2";
+                    }
+                    else if (dataTypeName.Equals("smalldatetime", StringComparison.OrdinalIgnoreCase))
+                    {
+                        sqlType = "SMALLDATETIME";
+                    }
+                    else if (dataTypeName.Equals("date", StringComparison.OrdinalIgnoreCase))
+                    {
+                        sqlType = "DATE";
+                    }
+                    // else keep DATETIME (default)
+                }
+                // Handle binary types - detect BINARY vs VARBINARY
+                else if (baseSqlType == "VARBINARY")
+                {
+                    var isBinary = dataTypeName.Equals("binary", StringComparison.OrdinalIgnoreCase);
+                    if (isBinary && maxLength > 0 && maxLength <= 8000)
+                    {
+                        sqlType = $"BINARY({maxLength})";
+                    }
+                    else
+                    {
+                        sqlType = maxLength > 0 && maxLength <= 8000 ? $"VARBINARY({maxLength})" : "VARBINARY(MAX)";
+                    }
                 }
 
                 columnDefs.Add($"[{col.ColumnName}] {sqlType} {(isNullable ? "NULL" : "NOT NULL")}");
             }
             else
             {
-                columnDefs.Add($"[{col.ColumnName}] {sqlType} NULL");
+                columnDefs.Add($"[{col.ColumnName}] {baseSqlType} NULL");
             }
         }
 
@@ -301,19 +353,19 @@ public class DataTransferService : IDataTransferService
     {
         return type.Name switch
         {
-            "String" => "NVARCHAR(MAX)",
+            "String" => "NVARCHAR",
             "Int32" => "INT",
             "Int64" => "BIGINT",
             "Int16" => "SMALLINT",
             "Byte" => "TINYINT",
             "Boolean" => "BIT",
-            "DateTime" => "DATETIME2",
+            "DateTime" => "DATETIME",
             "DateTimeOffset" => "DATETIMEOFFSET",
-            "Decimal" => "DECIMAL(18,4)",
+            "Decimal" => "DECIMAL",
             "Double" => "FLOAT",
             "Single" => "REAL",
             "Guid" => "UNIQUEIDENTIFIER",
-            "Byte[]" => "VARBINARY(MAX)",
+            "Byte[]" => "VARBINARY",
             _ => "NVARCHAR(MAX)"
         };
     }

@@ -442,7 +442,7 @@ public class MongoToMssqlService : IMongoToMssqlService
             var targetCol = options.FieldMappings?.GetValueOrDefault(col) ?? col;
             var safeColName = SqlValidator.SafeIdentifier(targetCol);
             var colType = columnTypes.TryGetValue(col, out var t) ? t : typeof(string);
-            var sqlType = GetSqlType(colType);
+            var sqlType = GetSqlTypeForMongo(colType);
             columnDefs.Add($"    {safeColName} {sqlType} NULL");
         }
 
@@ -454,7 +454,12 @@ public class MongoToMssqlService : IMongoToMssqlService
         await createCmd.ExecuteNonQueryAsync(cancellationToken);
     }
 
-    private static string GetSqlType(Type type)
+    /// <summary>
+    /// Gets SQL type for MongoDB data. Uses safe defaults since MongoDB is schemaless.
+    /// For decimal: DECIMAL(38,18) to handle MongoDB's Decimal128 without truncation.
+    /// For datetime: DATETIME for standard compatibility.
+    /// </summary>
+    private static string GetSqlTypeForMongo(Type type)
     {
         var underlyingType = Nullable.GetUnderlyingType(type) ?? type;
         
@@ -466,9 +471,9 @@ public class MongoToMssqlService : IMongoToMssqlService
             "Int16" => "SMALLINT",
             "Byte" => "TINYINT",
             "Boolean" => "BIT",
-            "DateTime" => "DATETIME2",
+            "DateTime" => "DATETIME",  // Standard datetime for compatibility
             "DateTimeOffset" => "DATETIMEOFFSET",
-            "Decimal" => "DECIMAL(18,4)",
+            "Decimal" => "DECIMAL(38,18)", // Max precision for MongoDB Decimal128 compatibility
             "Double" => "FLOAT",
             "Single" => "REAL",
             "Guid" => "UNIQUEIDENTIFIER",
