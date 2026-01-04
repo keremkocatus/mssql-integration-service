@@ -1,9 +1,10 @@
 # MSSQL Integration Service
 
-A comprehensive MSSQL integration service built with .NET 9 and Clean Architecture. Provides ETL capabilities including executing SQL queries, data transfer between MSSQL databases, and **MongoDB to MSSQL** data migration via REST API.
+A comprehensive MSSQL integration service built with .NET 9 and Clean Architecture. Provides **memory-efficient ETL capabilities** including executing SQL queries, data transfer between MSSQL databases, and **MongoDB to MSSQL** data migration via REST API.
 
 ## 🚀 Features
 
+### Core Features
 - ✅ Execute SELECT queries with parameters
 - ✅ Execute INSERT/UPDATE/DELETE commands
 - ✅ Execute stored procedures
@@ -12,10 +13,21 @@ A comprehensive MSSQL integration service built with .NET 9 and Clean Architectu
 - ✅ **MongoDB to MSSQL transfer** (with aggregation pipeline support)
 - ✅ **Data sync** (Delete-Insert pattern)
 - ✅ **Bulk insert** operations
-- ✅ **Request logging** (Console, File, MongoDB)
+
+### Performance & Efficiency
+- ✅ **Memory-efficient streaming** - No full dataset loading into RAM
+- ✅ **SqlBulkCopy with EnableStreaming** - Direct IDataReader streaming
+- ✅ **Cursor-based MongoDB reads** - Processes documents one at a time
+- ✅ **CommandBehavior.SequentialAccess** - Optimized for large columns
+
+### Security
+- ✅ **SQL Injection protection** - All table/column names sanitized with `SafeTableName`/`SafeIdentifier`
 - ✅ **Sensitive data masking** (connection strings, passwords in logs)
+- ✅ **Parameterized queries** - All user inputs use SQL parameters
+
+### Observability
+- ✅ **Request logging** (Console, File, MongoDB)
 - ✅ **Custom exception handling** (ValidationException, NotFoundException, DatabaseException)
-- ✅ SQL Injection protection
 - ✅ Database info & schema discovery
 - ✅ Connection testing
 - ✅ Health check endpoints
@@ -25,11 +37,47 @@ A comprehensive MSSQL integration service built with .NET 9 and Clean Architectu
 
 ```
 src/
-├── MssqlIntegrationService.Domain/           # Domain layer (entities, interfaces)
+├── MssqlIntegrationService.Domain/           # Domain layer (entities, interfaces, validation)
 ├── MssqlIntegrationService.Application/      # Application layer (DTOs, services)
-├── MssqlIntegrationService.Infrastructure/   # Infrastructure layer (SQL implementation)
+├── MssqlIntegrationService.Infrastructure/   # Infrastructure layer (SQL implementation, streaming)
+│   ├── Services/                             # Database services
+│   └── Data/                                 # Streaming helpers (DataReaders)
 └── MssqlIntegrationService.API/              # API layer (controllers, middleware)
+
+tests/
+└── MssqlIntegrationService.Tests/            # Unit tests (124 tests)
 ```
+
+## 🏗️ Architecture
+
+This project follows **Clean Architecture** principles:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                      API Layer                               │
+│              (Controllers, Middleware)                       │
+├─────────────────────────────────────────────────────────────┤
+│                  Application Layer                           │
+│           (DTOs, App Services, Interfaces)                   │
+├─────────────────────────────────────────────────────────────┤
+│                 Infrastructure Layer                         │
+│    (Database Services, Streaming DataReaders, Logging)       │
+├─────────────────────────────────────────────────────────────┤
+│                    Domain Layer                              │
+│       (Entities, Interfaces, Validation, Exceptions)         │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### Memory-Efficient Streaming
+
+All ETL operations use **streaming** to avoid loading entire datasets into memory:
+
+| Component | Traditional | Streaming (Current) |
+|-----------|-------------|---------------------|
+| DataTransfer | `DataTable` in RAM | `IDataReader` → `SqlBulkCopy` |
+| DataSync | `List<T>` buffer | Temp table + streaming |
+| MongoToMssql | `ToListAsync()` | `IAsyncCursor` + `BsonDocumentDataReader` |
+| BulkInsert | Array to DataTable | `ObjectDataReader` streaming |
 
 ## 🏃‍♂️ Running the Service
 
@@ -331,7 +379,7 @@ Server=sqlserver;Database=master;User Id=sa;Password=YourStrong@Passw0rd;TrustSe
 ## 🧪 Running Tests
 
 ```bash
-# Run all tests
+# Run all tests (124 tests)
 dotnet test
 
 # Run with coverage
@@ -339,9 +387,33 @@ dotnet test --collect:"XPlat Code Coverage"
 
 # Run specific test project
 dotnet test tests/MssqlIntegrationService.Tests
+
+# Run with detailed output
+dotnet test --logger "console;verbosity=normal"
 ```
 
-## � Security Features
+### Test Coverage
+- ✅ Domain layer (SqlValidator, Result, Exceptions)
+- ✅ Application layer (AppServices)
+- ✅ Controllers (MongoToMssql, etc.)
+- ✅ Middleware (ExceptionMiddleware, LogMasking)
+
+## 🔐 Security Features
+
+### SQL Injection Protection
+All table and column names are sanitized using `SqlValidator`:
+
+```csharp
+// Safe table name: [dbo].[Users]
+var safeTable = SqlValidator.SafeTableName("dbo.Users");
+
+// Safe identifier: [ColumnName]
+var safeColumn = SqlValidator.SafeIdentifier("ColumnName");
+
+// Validation
+bool isValid = SqlValidator.IsValidTableName("Users"); // true
+bool isInvalid = SqlValidator.IsValidTableName("Users; DROP TABLE--"); // false
+```
 
 ### Sensitive Data Masking
 Request logging automatically masks sensitive data in JSON payloads:
@@ -368,6 +440,38 @@ The API returns appropriate HTTP status codes based on exception types:
 
 > **Note:** In production, internal error details are hidden for security.
 
-## �📜 License
+## 📊 Performance Considerations
+
+### Memory Usage
+All ETL services are designed for **low memory footprint**:
+
+| Operation | Memory Pattern | Description |
+|-----------|----------------|-------------|
+| **Data Transfer** | O(batch) | Only batch-size rows in memory at any time |
+| **Data Sync** | O(batch) | Streams to temp table, then SQL-based operations |
+| **MongoDB Transfer** | O(batch) | Cursor-based streaming with batch processing |
+| **Bulk Insert** | O(1) per row | `ObjectDataReader` yields rows on-demand |
+
+### Recommended Settings for Large Datasets
+
+```json
+{
+  "options": {
+    "batchSize": 5000,
+    "timeout": 600,
+    "useTransaction": true
+  }
+}
+```
+
+### Streaming Components
+
+| Class | Purpose |
+|-------|---------|
+| `RowCountingDataReader` | Wraps IDataReader to count rows during streaming |
+| `ObjectDataReader` | Converts `IEnumerable<IDictionary>` to `IDataReader` |
+| `BsonDocumentDataReader` | Streams MongoDB cursor to `IDataReader` |
+
+## 📜 License
 
 MIT

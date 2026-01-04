@@ -9,11 +9,16 @@ using MssqlIntegrationService.Domain.Common;
 using MssqlIntegrationService.Domain.Entities;
 using MssqlIntegrationService.Domain.Interfaces;
 using MssqlIntegrationService.Domain.Validation;
+using MssqlIntegrationService.Infrastructure.Data;
 
 namespace MssqlIntegrationService.Infrastructure.Services;
 
 public class MongoToMssqlService : IMongoToMssqlService
 {
+    /// <summary>
+    /// Memory-efficient MongoDB to MSSQL transfer using cursor-based streaming.
+    /// Documents are processed one at a time without loading entire collection into memory.
+    /// </summary>
     public async Task<Result<MongoToMssqlResult>> TransferAsync(
         string mongoConnectionString,
         string mongoDatabaseName,
@@ -44,11 +49,11 @@ public class MongoToMssqlService : IMongoToMssqlService
                 ? FilterDefinition<BsonDocument>.Empty
                 : BsonDocument.Parse(mongoFilter);
 
-            // Get documents
-            var documents = await collection.Find(filter).ToListAsync(cancellationToken);
-            result.TotalDocumentsRead = documents.Count;
+            // Get cursor for streaming (not ToListAsync!)
+            using var cursor = await collection.Find(filter).ToCursorAsync(cancellationToken);
 
-            if (documents.Count == 0)
+            // Check if there are any documents
+            if (!await cursor.MoveNextAsync(cancellationToken) || !cursor.Current.Any())
             {
                 result.Warnings.Add("No documents found matching the filter");
                 stopwatch.Stop();
@@ -56,8 +61,8 @@ public class MongoToMssqlService : IMongoToMssqlService
                 return Result<MongoToMssqlResult>.Success(result);
             }
 
-            // Process and transfer
-            await TransferDocumentsToMssql(documents, mssqlConnectionString, targetTable, options, result, cancellationToken);
+            // Stream transfer using cursor
+            await TransferWithCursorAsync(cursor, mssqlConnectionString, targetTable, options, result, cancellationToken);
 
             stopwatch.Stop();
             result.ExecutionTimeMs = stopwatch.ElapsedMilliseconds;
@@ -80,6 +85,9 @@ public class MongoToMssqlService : IMongoToMssqlService
         }
     }
 
+    /// <summary>
+    /// Memory-efficient MongoDB aggregation to MSSQL transfer using cursor-based streaming.
+    /// </summary>
     public async Task<Result<MongoToMssqlResult>> TransferWithAggregationAsync(
         string mongoConnectionString,
         string mongoDatabaseName,
@@ -105,16 +113,16 @@ public class MongoToMssqlService : IMongoToMssqlService
             var database = mongoClient.GetDatabase(mongoDatabaseName);
             var collection = database.GetCollection<BsonDocument>(mongoCollection);
 
-            // Parse aggregation pipeline - deserialize JSON array to BsonDocument array
+            // Parse aggregation pipeline
             var pipelineArray = MongoDB.Bson.Serialization.BsonSerializer.Deserialize<BsonArray>(aggregationPipeline);
             var pipelineStages = pipelineArray.Select(stage => (BsonDocument)stage).ToArray();
             var pipeline = PipelineDefinition<BsonDocument, BsonDocument>.Create(pipelineStages);
 
-            // Execute aggregation
-            var documents = await collection.Aggregate(pipeline).ToListAsync(cancellationToken);
-            result.TotalDocumentsRead = documents.Count;
+            // Aggregate() returns IAsyncCursor directly, no need for ToCursorAsync
+            using var cursor = await collection.AggregateAsync(pipeline, cancellationToken: cancellationToken);
 
-            if (documents.Count == 0)
+            // Check if there are any documents
+            if (!await cursor.MoveNextAsync(cancellationToken) || !cursor.Current.Any())
             {
                 result.Warnings.Add("No documents returned from aggregation pipeline");
                 stopwatch.Stop();
@@ -122,8 +130,8 @@ public class MongoToMssqlService : IMongoToMssqlService
                 return Result<MongoToMssqlResult>.Success(result);
             }
 
-            // Process and transfer
-            await TransferDocumentsToMssql(documents, mssqlConnectionString, targetTable, options, result, cancellationToken);
+            // Stream transfer using cursor
+            await TransferWithCursorAsync(cursor, mssqlConnectionString, targetTable, options, result, cancellationToken);
 
             stopwatch.Stop();
             result.ExecutionTimeMs = stopwatch.ElapsedMilliseconds;
@@ -146,25 +154,66 @@ public class MongoToMssqlService : IMongoToMssqlService
         }
     }
 
-    private async Task TransferDocumentsToMssql(
-        List<BsonDocument> documents,
+    /// <summary>
+    /// Memory-efficient transfer using MongoDB cursor streaming.
+    /// Schema is inferred from first batch, then data streams directly to SQL Server.
+    /// </summary>
+    private async Task TransferWithCursorAsync(
+        IAsyncCursor<BsonDocument> cursor,
         string mssqlConnectionString,
         string targetTable,
         MongoToMssqlOptions options,
         MongoToMssqlResult result,
         CancellationToken cancellationToken)
     {
-        // Convert documents to DataTable
-        var (dataTable, failedCount) = ConvertToDataTable(documents, options, result);
-        result.FailedDocuments = failedCount;
+        // First, sample documents to determine schema (from current batch which we already loaded)
+        var sampleDocs = cursor.Current.Take(options.SchemaSampleSize).ToList();
+        var (columns, columnTypes) = InferSchemaFromSamples(sampleDocs, options, result);
 
-        if (dataTable.Rows.Count == 0)
+        if (columns.Count == 0)
         {
-            result.Warnings.Add("No valid rows to transfer after conversion");
+            result.Warnings.Add("No valid columns found after schema inference");
             return;
         }
 
-        // Connect to MSSQL
+        // Create async enumerator that yields all documents including the first batch
+        async IAsyncEnumerable<BsonDocument> StreamAllDocuments()
+        {
+            // Yield documents from first batch (already loaded during schema inference)
+            foreach (var doc in cursor.Current)
+            {
+                yield return doc;
+            }
+
+            // Stream remaining batches
+            while (await cursor.MoveNextAsync(cancellationToken))
+            {
+                foreach (var doc in cursor.Current)
+                {
+                    yield return doc;
+                }
+            }
+        }
+
+        // Prepare document converter function
+        Dictionary<string, object?> ConvertDocument(BsonDocument doc)
+        {
+            return options.FlattenNestedDocuments
+                ? FlattenDocument(doc, options.FlattenSeparator, options.ArrayHandling)
+                : ConvertToDictionary(doc, options.ArrayHandling);
+        }
+
+        // Create streaming data reader
+        var enumerator = StreamAllDocuments().GetAsyncEnumerator(cancellationToken);
+        await using var bsonReader = new BsonDocumentDataReader(
+            enumerator,
+            columns,
+            columnTypes,
+            ConvertDocument,
+            options.IncludeFields != null ? new HashSet<string>(options.IncludeFields) : null,
+            options.ExcludeFields != null ? new HashSet<string>(options.ExcludeFields) : null);
+
+        // Connect to MSSQL and stream data
         await using var connection = new SqlConnection(mssqlConnectionString);
         await connection.OpenAsync(cancellationToken);
 
@@ -181,7 +230,7 @@ public class MongoToMssqlService : IMongoToMssqlService
             // Create table if needed
             if (options.CreateTableIfNotExists)
             {
-                await CreateTableIfNotExistsAsync(connection, transaction, targetTable, dataTable, options.Timeout, cancellationToken);
+                await CreateTableIfNotExistsAsync(connection, transaction, targetTable, columns, columnTypes, options, cancellationToken);
                 result.Warnings.Add($"Table '{targetTable}' created or verified");
             }
 
@@ -194,21 +243,28 @@ public class MongoToMssqlService : IMongoToMssqlService
                 result.Warnings.Add($"Table '{targetTable}' truncated");
             }
 
-            // Bulk insert
-            using var bulkCopy = new SqlBulkCopy(connection, SqlBulkCopyOptions.Default, transaction);
-            bulkCopy.DestinationTableName = safeTableName;
-            bulkCopy.BatchSize = options.BatchSize;
-            bulkCopy.BulkCopyTimeout = options.Timeout;
+            // Bulk copy with streaming
+            using var bulkCopy = new SqlBulkCopy(connection, SqlBulkCopyOptions.Default, transaction)
+            {
+                DestinationTableName = safeTableName,
+                BatchSize = options.BatchSize,
+                BulkCopyTimeout = options.Timeout,
+                EnableStreaming = true
+            };
 
             // Map columns
-            foreach (DataColumn col in dataTable.Columns)
+            foreach (var col in columns)
             {
-                var targetCol = options.FieldMappings?.GetValueOrDefault(col.ColumnName) ?? col.ColumnName;
-                bulkCopy.ColumnMappings.Add(col.ColumnName, targetCol);
+                var targetCol = options.FieldMappings?.GetValueOrDefault(col) ?? col;
+                bulkCopy.ColumnMappings.Add(col, targetCol);
             }
 
-            await bulkCopy.WriteToServerAsync(dataTable, cancellationToken);
-            result.TotalRowsWritten = dataTable.Rows.Count;
+            // Stream data from MongoDB to SQL Server
+            await bulkCopy.WriteToServerAsync(bsonReader, cancellationToken);
+
+            result.TotalDocumentsRead = (int)bsonReader.RowCount;
+            result.TotalRowsWritten = (int)bsonReader.RowCount;
+            result.FailedDocuments = bsonReader.FailedCount;
 
             // Commit transaction
             if (transaction != null)
@@ -226,17 +282,17 @@ public class MongoToMssqlService : IMongoToMssqlService
         }
     }
 
-    private (DataTable dataTable, int failedCount) ConvertToDataTable(
-        List<BsonDocument> documents,
+    /// <summary>
+    /// Infer schema from sample documents without loading entire collection.
+    /// </summary>
+    private (List<string> columns, Dictionary<string, Type> columnTypes) InferSchemaFromSamples(
+        List<BsonDocument> sampleDocs,
         MongoToMssqlOptions options,
         MongoToMssqlResult result)
     {
-        var dataTable = new DataTable();
-        var failedCount = 0;
         var columnTypes = new Dictionary<string, Type>();
 
-        // First pass: determine schema from all documents
-        foreach (var doc in documents)
+        foreach (var doc in sampleDocs)
         {
             var flatDoc = options.FlattenNestedDocuments
                 ? FlattenDocument(doc, options.FlattenSeparator, options.ArrayHandling)
@@ -256,6 +312,14 @@ public class MongoToMssqlService : IMongoToMssqlService
                 if (options.ExcludeFields != null && options.ExcludeFields.Contains(fieldName))
                     continue;
 
+                // Validate column name
+                var columnName = options.FieldMappings?.GetValueOrDefault(fieldName) ?? fieldName;
+                if (!SqlValidator.IsValidColumnName(columnName))
+                {
+                    result.Warnings.Add($"Skipping invalid column name: '{columnName}'");
+                    continue;
+                }
+
                 if (!columnTypes.ContainsKey(fieldName) && kvp.Value != null)
                 {
                     columnTypes[fieldName] = kvp.Value.GetType();
@@ -263,49 +327,7 @@ public class MongoToMssqlService : IMongoToMssqlService
             }
         }
 
-        // Create columns
-        foreach (var kvp in columnTypes)
-        {
-            var columnName = options.FieldMappings?.GetValueOrDefault(kvp.Key) ?? kvp.Key;
-            // Validate column name
-            if (!SqlValidator.IsValidColumnName(columnName))
-            {
-                result.Warnings.Add($"Skipping invalid column name: '{columnName}'");
-                continue;
-            }
-            dataTable.Columns.Add(new DataColumn(kvp.Key, kvp.Value) { AllowDBNull = true });
-        }
-
-        // Second pass: populate data
-        foreach (var doc in documents)
-        {
-            try
-            {
-                var flatDoc = options.FlattenNestedDocuments
-                    ? FlattenDocument(doc, options.FlattenSeparator, options.ArrayHandling)
-                    : ConvertToDictionary(doc, options.ArrayHandling);
-
-                var row = dataTable.NewRow();
-                foreach (DataColumn col in dataTable.Columns)
-                {
-                    if (flatDoc.TryGetValue(col.ColumnName, out var value))
-                    {
-                        row[col.ColumnName] = value ?? DBNull.Value;
-                    }
-                    else
-                    {
-                        row[col.ColumnName] = DBNull.Value;
-                    }
-                }
-                dataTable.Rows.Add(row);
-            }
-            catch
-            {
-                failedCount++;
-            }
-        }
-
-        return (dataTable, failedCount);
+        return (columnTypes.Keys.ToList(), columnTypes);
     }
 
     private Dictionary<string, object?> FlattenDocument(BsonDocument doc, string separator, string arrayHandling, string prefix = "")
@@ -394,8 +416,9 @@ public class MongoToMssqlService : IMongoToMssqlService
         SqlConnection connection,
         SqlTransaction? transaction,
         string tableName,
-        DataTable dataTable,
-        int timeout,
+        List<string> columns,
+        Dictionary<string, Type> columnTypes,
+        MongoToMssqlOptions options,
         CancellationToken cancellationToken)
     {
         var safeTableName = SqlValidator.SafeTableName(tableName);
@@ -404,7 +427,7 @@ public class MongoToMssqlService : IMongoToMssqlService
         var checkSql = $"SELECT COUNT(*) FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = @tableName";
         await using var checkCmd = new SqlCommand(checkSql, connection, transaction);
         checkCmd.Parameters.AddWithValue("@tableName", tableName.Contains('.') ? tableName.Split('.')[1] : tableName);
-        checkCmd.CommandTimeout = timeout;
+        checkCmd.CommandTimeout = options.Timeout;
         
         var exists = (int)await checkCmd.ExecuteScalarAsync(cancellationToken)! > 0;
         if (exists) return;
@@ -414,10 +437,12 @@ public class MongoToMssqlService : IMongoToMssqlService
         sb.AppendLine($"CREATE TABLE {safeTableName} (");
 
         var columnDefs = new List<string>();
-        foreach (DataColumn col in dataTable.Columns)
+        foreach (var col in columns)
         {
-            var safeColName = SqlValidator.SafeIdentifier(col.ColumnName);
-            var sqlType = GetSqlType(col.DataType);
+            var targetCol = options.FieldMappings?.GetValueOrDefault(col) ?? col;
+            var safeColName = SqlValidator.SafeIdentifier(targetCol);
+            var colType = columnTypes.TryGetValue(col, out var t) ? t : typeof(string);
+            var sqlType = GetSqlType(colType);
             columnDefs.Add($"    {safeColName} {sqlType} NULL");
         }
 
@@ -425,7 +450,7 @@ public class MongoToMssqlService : IMongoToMssqlService
         sb.AppendLine(")");
 
         await using var createCmd = new SqlCommand(sb.ToString(), connection, transaction);
-        createCmd.CommandTimeout = timeout;
+        createCmd.CommandTimeout = options.Timeout;
         await createCmd.ExecuteNonQueryAsync(cancellationToken);
     }
 

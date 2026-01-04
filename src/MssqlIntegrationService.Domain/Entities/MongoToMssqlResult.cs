@@ -102,4 +102,10 @@ public class MongoToMssqlOptions
     /// Handle arrays: "Serialize" (JSON string), "Skip", "FirstElement"
     /// </summary>
     public string ArrayHandling { get; set; } = "Serialize";
+
+    /// <summary>
+    /// Number of documents to sample for schema inference (default: 100).
+    /// Higher values give more accurate schema but use more memory during initialization.
+    /// </summary>
+    public int SchemaSampleSize { get; set; } = 100;
 }

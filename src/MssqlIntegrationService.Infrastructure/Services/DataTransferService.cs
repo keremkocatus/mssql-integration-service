@@ -1,14 +1,22 @@
 using System.Data;
+using System.Data.Common;
 using System.Diagnostics;
 using Microsoft.Data.SqlClient;
 using MssqlIntegrationService.Domain.Common;
 using MssqlIntegrationService.Domain.Entities;
 using MssqlIntegrationService.Domain.Interfaces;
+using MssqlIntegrationService.Domain.Validation;
+using MssqlIntegrationService.Infrastructure.Data;
 
 namespace MssqlIntegrationService.Infrastructure.Services;
 
 public class DataTransferService : IDataTransferService
 {
+    /// <summary>
+    /// Memory-efficient data transfer using streaming.
+    /// Data is read directly from source and written to target without loading entire dataset into RAM.
+    /// Uses SqlBulkCopy's native IDataReader support for optimal memory usage.
+    /// </summary>
     public async Task<Result<TransferResult>> TransferDataAsync(
         string sourceConnectionString,
         string targetConnectionString,
@@ -27,7 +35,7 @@ public class DataTransferService : IDataTransferService
 
         try
         {
-            // Read data from source
+            // Open source connection and get reader (streaming mode)
             await using var sourceConnection = new SqlConnection(sourceConnectionString);
             await sourceConnection.OpenAsync(cancellationToken);
 
@@ -36,9 +44,10 @@ public class DataTransferService : IDataTransferService
                 CommandTimeout = options.Timeout
             };
 
-            await using var reader = await sourceCommand.ExecuteReaderAsync(cancellationToken);
+            // Use SequentialAccess for better memory efficiency with large columns
+            await using var reader = await sourceCommand.ExecuteReaderAsync(CommandBehavior.SequentialAccess, cancellationToken);
 
-            // Get schema information
+            // Get schema information for table creation if needed
             var schemaTable = await reader.GetSchemaTableAsync(cancellationToken);
             var columns = new List<DataColumn>();
 
@@ -52,29 +61,7 @@ public class DataTransferService : IDataTransferService
                 }
             }
 
-            // Create DataTable for bulk copy
-            var dataTable = new DataTable();
-            foreach (var col in columns)
-            {
-                dataTable.Columns.Add(new DataColumn(col.ColumnName, col.DataType));
-            }
-
-            // Read all rows
-            while (await reader.ReadAsync(cancellationToken))
-            {
-                var row = dataTable.NewRow();
-                for (int i = 0; i < reader.FieldCount; i++)
-                {
-                    row[i] = reader.GetValue(i);
-                }
-                dataTable.Rows.Add(row);
-                result.TotalRowsRead++;
-            }
-
-            await reader.CloseAsync();
-            await sourceConnection.CloseAsync();
-
-            // Write to target
+            // Open target connection
             await using var targetConnection = new SqlConnection(targetConnectionString);
             await targetConnection.OpenAsync(cancellationToken);
 
@@ -89,7 +76,8 @@ public class DataTransferService : IDataTransferService
                 // Truncate if requested
                 if (options.TruncateTargetTable)
                 {
-                    await using var truncateCommand = new SqlCommand($"TRUNCATE TABLE {targetTable}", targetConnection, transaction);
+                    var safeTableName = SqlValidator.SafeTableName(targetTable);
+                    await using var truncateCommand = new SqlCommand($"TRUNCATE TABLE {safeTableName}", targetConnection, transaction);
                     await truncateCommand.ExecuteNonQueryAsync(cancellationToken);
                     result.Warnings.Add($"Table {targetTable} was truncated before insert");
                 }
@@ -97,19 +85,26 @@ public class DataTransferService : IDataTransferService
                 // Create table if requested
                 if (options.CreateTableIfNotExists)
                 {
-                    var createTableSql = GenerateCreateTableSql(targetTable, columns, schemaTable);
+                    var safeTableForCreate = SqlValidator.SafeTableName(targetTable);
+                    var createTableSql = GenerateCreateTableSql(safeTableForCreate, columns, schemaTable);
                     await using var checkCommand = new SqlCommand(
-                        $"IF OBJECT_ID('{targetTable}', 'U') IS NULL BEGIN {createTableSql} END",
+                        $"IF OBJECT_ID('{safeTableForCreate}', 'U') IS NULL BEGIN {createTableSql} END",
                         targetConnection, transaction);
                     await checkCommand.ExecuteNonQueryAsync(cancellationToken);
                 }
 
-                // Bulk copy
+                // Create counting wrapper to track rows while streaming
+                using var countingReader = new RowCountingDataReader(reader);
+
+                // Bulk copy directly from reader - NO DataTable in memory!
+                // SqlBulkCopy will read in batches internally based on BatchSize
+                var destTableName = SqlValidator.SafeTableName(targetTable);
                 using var bulkCopy = new SqlBulkCopy(targetConnection, SqlBulkCopyOptions.Default, transaction)
                 {
-                    DestinationTableName = targetTable,
+                    DestinationTableName = destTableName,
                     BatchSize = options.BatchSize,
-                    BulkCopyTimeout = options.Timeout
+                    BulkCopyTimeout = options.Timeout,
+                    EnableStreaming = true // Enable streaming for better memory efficiency
                 };
 
                 // Column mappings
@@ -122,14 +117,17 @@ public class DataTransferService : IDataTransferService
                 }
                 else
                 {
-                    foreach (DataColumn col in dataTable.Columns)
+                    foreach (var col in columns)
                     {
                         bulkCopy.ColumnMappings.Add(col.ColumnName, col.ColumnName);
                     }
                 }
 
-                await bulkCopy.WriteToServerAsync(dataTable, cancellationToken);
-                result.TotalRowsWritten = result.TotalRowsRead;
+                // Stream data directly from source to target
+                await bulkCopy.WriteToServerAsync(countingReader, cancellationToken);
+                
+                result.TotalRowsRead = (int)countingReader.RowCount;
+                result.TotalRowsWritten = (int)countingReader.RowCount;
 
                 if (transaction != null)
                 {
@@ -162,6 +160,10 @@ public class DataTransferService : IDataTransferService
         }
     }
 
+    /// <summary>
+    /// Memory-efficient bulk insert using streaming.
+    /// Uses ObjectDataReader to stream data directly without loading entire dataset into a DataTable.
+    /// </summary>
     public async Task<Result<TransferResult>> BulkInsertAsync(
         string connectionString,
         string tableName,
@@ -178,32 +180,25 @@ public class DataTransferService : IDataTransferService
 
         try
         {
-            var dataList = data.ToList();
-            if (dataList.Count == 0)
+            // Peek at first item to get column names without materializing entire collection
+            using var enumerator = data.GetEnumerator();
+            if (!enumerator.MoveNext())
             {
+                // Empty data
                 return Result<TransferResult>.Success(result);
             }
 
-            // Create DataTable from data
-            var dataTable = new DataTable();
-            var firstRow = dataList.First();
+            var firstRow = enumerator.Current;
+            var columns = firstRow.Keys.ToList();
 
-            foreach (var key in firstRow.Keys)
+            // Create a streaming enumerable that yields first row + remaining rows
+            IEnumerable<IDictionary<string, object?>> StreamData()
             {
-                var value = firstRow[key];
-                var type = value?.GetType() ?? typeof(string);
-                dataTable.Columns.Add(new DataColumn(key, Nullable.GetUnderlyingType(type) ?? type));
-            }
-
-            foreach (var item in dataList)
-            {
-                var row = dataTable.NewRow();
-                foreach (var key in item.Keys)
+                yield return firstRow;
+                while (enumerator.MoveNext())
                 {
-                    row[key] = item[key] ?? DBNull.Value;
+                    yield return enumerator.Current;
                 }
-                dataTable.Rows.Add(row);
-                result.TotalRowsRead++;
             }
 
             await using var connection = new SqlConnection(connectionString);
@@ -217,20 +212,28 @@ public class DataTransferService : IDataTransferService
 
             try
             {
+                // Use ObjectDataReader for memory-efficient streaming
+                using var objectReader = new ObjectDataReader<IDictionary<string, object?>>(StreamData(), columns);
+
+                var safeTableName = SqlValidator.SafeTableName(tableName);
                 using var bulkCopy = new SqlBulkCopy(connection, SqlBulkCopyOptions.Default, transaction)
                 {
-                    DestinationTableName = tableName,
+                    DestinationTableName = safeTableName,
                     BatchSize = options.BatchSize,
-                    BulkCopyTimeout = options.Timeout
+                    BulkCopyTimeout = options.Timeout,
+                    EnableStreaming = true
                 };
 
-                foreach (DataColumn col in dataTable.Columns)
+                // Column mappings
+                foreach (var col in columns)
                 {
-                    bulkCopy.ColumnMappings.Add(col.ColumnName, col.ColumnName);
+                    bulkCopy.ColumnMappings.Add(col, col);
                 }
 
-                await bulkCopy.WriteToServerAsync(dataTable, cancellationToken);
-                result.TotalRowsWritten = result.TotalRowsRead;
+                await bulkCopy.WriteToServerAsync(objectReader, cancellationToken);
+                
+                result.TotalRowsRead = (int)objectReader.RowCount;
+                result.TotalRowsWritten = (int)objectReader.RowCount;
 
                 if (transaction != null)
                 {

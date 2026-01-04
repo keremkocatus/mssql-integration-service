@@ -1,4 +1,5 @@
 using System.Data;
+using System.Data.Common;
 using System.Diagnostics;
 using System.Text;
 using Microsoft.Data.SqlClient;
@@ -6,11 +7,16 @@ using MssqlIntegrationService.Domain.Common;
 using MssqlIntegrationService.Domain.Entities;
 using MssqlIntegrationService.Domain.Interfaces;
 using MssqlIntegrationService.Domain.Validation;
+using MssqlIntegrationService.Infrastructure.Data;
 
 namespace MssqlIntegrationService.Infrastructure.Services;
 
 public class DataSyncService : IDataSyncService
 {
+    /// <summary>
+    /// Memory-efficient data synchronization using streaming.
+    /// Data is read from source and streamed directly to temp table without loading entire dataset into RAM.
+    /// </summary>
     public async Task<Result<SyncResult>> SyncDataAsync(
         string sourceConnectionString,
         string targetConnectionString,
@@ -34,71 +40,42 @@ public class DataSyncService : IDataSyncService
 
         try
         {
-            // ===== STEP 1: Read data from source =====
-            var dataTable = new DataTable();
-            List<DataColumn> columns;
+            // ===== STEP 1: Open source connection and get streaming reader =====
+            await using var sourceConnection = new SqlConnection(sourceConnectionString);
+            await sourceConnection.OpenAsync(cancellationToken);
 
-            await using (var sourceConnection = new SqlConnection(sourceConnectionString))
+            await using var sourceCommand = new SqlCommand(sourceQuery, sourceConnection)
             {
-                await sourceConnection.OpenAsync(cancellationToken);
+                CommandTimeout = options.Timeout
+            };
 
-                await using var sourceCommand = new SqlCommand(sourceQuery, sourceConnection)
+            // Use SequentialAccess for better memory efficiency
+            await using var reader = await sourceCommand.ExecuteReaderAsync(CommandBehavior.SequentialAccess, cancellationToken);
+
+            // Get schema
+            var schemaTable = await reader.GetSchemaTableAsync(cancellationToken);
+            var columns = new List<DataColumn>();
+
+            if (schemaTable != null)
+            {
+                foreach (DataRow row in schemaTable.Rows)
                 {
-                    CommandTimeout = options.Timeout
-                };
-
-                await using var reader = await sourceCommand.ExecuteReaderAsync(cancellationToken);
-
-                // Get schema
-                var schemaTable = await reader.GetSchemaTableAsync(cancellationToken);
-                columns = new List<DataColumn>();
-
-                if (schemaTable != null)
-                {
-                    foreach (DataRow row in schemaTable.Rows)
-                    {
-                        var columnName = row["ColumnName"].ToString()!;
-                        var dataType = (Type)row["DataType"];
-                        
-                        // Handle nullable types
-                        if (dataType.IsValueType)
-                        {
-                            dataTable.Columns.Add(new DataColumn(columnName, dataType) { AllowDBNull = true });
-                        }
-                        else
-                        {
-                            dataTable.Columns.Add(new DataColumn(columnName, dataType));
-                        }
-                        columns.Add(new DataColumn(columnName, dataType));
-                    }
-                }
-
-                // Read data
-                while (await reader.ReadAsync(cancellationToken))
-                {
-                    var row = dataTable.NewRow();
-                    for (int i = 0; i < reader.FieldCount; i++)
-                    {
-                        row[i] = reader.GetValue(i);
-                    }
-                    dataTable.Rows.Add(row);
-                    result.TotalRowsRead++;
+                    var columnName = row["ColumnName"].ToString()!;
+                    var dataType = (Type)row["DataType"];
+                    columns.Add(new DataColumn(columnName, dataType));
                 }
             }
 
-            if (result.TotalRowsRead == 0)
+            if (columns.Count == 0)
             {
-                result.Warnings.Add("No rows read from source query");
-                stopwatch.Stop();
-                result.ExecutionTimeMs = stopwatch.ElapsedMilliseconds;
-                return Result<SyncResult>.Success(result);
+                return Result<SyncResult>.Failure("No columns found in source query result");
             }
 
             // Validate key columns exist
             foreach (var keyCol in keyColumns)
             {
-                var targetKeyCol = options.ColumnMappings?.GetValueOrDefault(keyCol) ?? keyCol;
-                if (!dataTable.Columns.Contains(keyCol))
+                var colExists = columns.Any(c => c.ColumnName.Equals(keyCol, StringComparison.OrdinalIgnoreCase));
+                if (!colExists)
                 {
                     return Result<SyncResult>.Failure($"Key column '{keyCol}' not found in source query result");
                 }
@@ -125,23 +102,46 @@ public class DataSyncService : IDataSyncService
                 }
                 result.Warnings.Add($"Created temp table: {tempTableName}");
 
-                // ===== STEP 3: Bulk insert into temp table =====
+                // ===== STEP 3: Stream data directly from source to temp table =====
+                // Use RowCountingDataReader to track rows while streaming
+                using var countingReader = new RowCountingDataReader(reader);
+
                 using (var bulkCopy = new SqlBulkCopy(targetConnection, SqlBulkCopyOptions.Default, transaction))
                 {
                     bulkCopy.DestinationTableName = tempTableName;
                     bulkCopy.BatchSize = options.BatchSize;
                     bulkCopy.BulkCopyTimeout = options.Timeout;
+                    bulkCopy.EnableStreaming = true;
 
                     // Column mappings
-                    foreach (DataColumn col in dataTable.Columns)
+                    foreach (var col in columns)
                     {
                         var targetCol = options.ColumnMappings?.GetValueOrDefault(col.ColumnName) ?? col.ColumnName;
                         bulkCopy.ColumnMappings.Add(col.ColumnName, targetCol);
                     }
 
-                    await bulkCopy.WriteToServerAsync(dataTable, cancellationToken);
+                    // Stream directly from source to temp table - NO DataTable in memory!
+                    await bulkCopy.WriteToServerAsync(countingReader, cancellationToken);
+                    result.TotalRowsRead = (int)countingReader.RowCount;
                 }
-                result.Warnings.Add($"Inserted {result.TotalRowsRead} rows into temp table");
+                result.Warnings.Add($"Streamed {result.TotalRowsRead} rows into temp table");
+
+                if (result.TotalRowsRead == 0)
+                {
+                    result.Warnings.Add("No rows read from source query");
+                    // Clean up temp table
+                    await using (var dropCmd = new SqlCommand($"DROP TABLE {tempTableName}", targetConnection, transaction))
+                    {
+                        await dropCmd.ExecuteNonQueryAsync(cancellationToken);
+                    }
+                    if (transaction != null)
+                    {
+                        await transaction.CommitAsync(cancellationToken);
+                    }
+                    stopwatch.Stop();
+                    result.ExecutionTimeMs = stopwatch.ElapsedMilliseconds;
+                    return Result<SyncResult>.Success(result);
+                }
 
                 // ===== STEP 4: Delete matching rows from target =====
                 var safeTargetTable = SqlValidator.SafeTableName(targetTable);
@@ -173,7 +173,7 @@ public class DataSyncService : IDataSyncService
                 result.Warnings.Add($"Deleted {result.RowsDeleted} rows from target table");
 
                 // ===== STEP 5: Insert from temp to target =====
-                var targetColumns = dataTable.Columns.Cast<DataColumn>()
+                var targetColumns = columns
                     .Select(c => options.ColumnMappings?.GetValueOrDefault(c.ColumnName) ?? c.ColumnName)
                     .ToList();
 
