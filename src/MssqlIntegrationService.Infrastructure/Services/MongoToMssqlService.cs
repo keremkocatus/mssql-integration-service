@@ -481,4 +481,228 @@ public class MongoToMssqlService : IMongoToMssqlService
             _ => "NVARCHAR(MAX)"
         };
     }
+
+    /// <summary>
+    /// Transfer MongoDB documents as raw JSON strings to a single-column MSSQL table.
+    /// Table name is suffixed with _JSON. Each document becomes one row with JSON string.
+    /// Useful for later parsing with OPENJSON in MSSQL.
+    /// </summary>
+    public async Task<Result<MongoToMssqlResult>> TransferAsJsonAsync(
+        string mongoConnectionString,
+        string mongoDatabaseName,
+        string mongoCollection,
+        string? mongoFilter,
+        string mssqlConnectionString,
+        string targetTable,
+        MongoToMssqlOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        options ??= new MongoToMssqlOptions();
+        var stopwatch = Stopwatch.StartNew();
+        
+        // Add _JSON suffix to table name
+        var jsonTableName = targetTable.EndsWith("_JSON", StringComparison.OrdinalIgnoreCase) 
+            ? targetTable 
+            : $"{targetTable}_JSON";
+        
+        var result = new MongoToMssqlResult
+        {
+            SourceCollection = mongoCollection,
+            TargetTable = jsonTableName
+        };
+
+        try
+        {
+            // Connect to MongoDB
+            var mongoClient = new MongoClient(mongoConnectionString);
+            var database = mongoClient.GetDatabase(mongoDatabaseName);
+            var collection = database.GetCollection<BsonDocument>(mongoCollection);
+
+            // Build filter
+            var filter = string.IsNullOrWhiteSpace(mongoFilter)
+                ? FilterDefinition<BsonDocument>.Empty
+                : BsonDocument.Parse(mongoFilter);
+
+            // Get cursor for streaming
+            using var cursor = await collection.Find(filter).ToCursorAsync(cancellationToken);
+
+            // Check if there are any documents
+            if (!await cursor.MoveNextAsync(cancellationToken) || !cursor.Current.Any())
+            {
+                result.Warnings.Add("No documents found matching the filter");
+                stopwatch.Stop();
+                result.ExecutionTimeMs = stopwatch.ElapsedMilliseconds;
+                return Result<MongoToMssqlResult>.Success(result);
+            }
+
+            // Transfer as JSON
+            await TransferAsJsonWithCursorAsync(cursor, mssqlConnectionString, jsonTableName, options, result, cancellationToken);
+
+            stopwatch.Stop();
+            result.ExecutionTimeMs = stopwatch.ElapsedMilliseconds;
+            return Result<MongoToMssqlResult>.Success(result);
+        }
+        catch (MongoException ex)
+        {
+            stopwatch.Stop();
+            return Result<MongoToMssqlResult>.Failure($"MongoDB Error: {ex.Message}");
+        }
+        catch (SqlException ex)
+        {
+            stopwatch.Stop();
+            return Result<MongoToMssqlResult>.Failure($"MSSQL Error: {ex.Message}", ex.Number);
+        }
+        catch (Exception ex)
+        {
+            stopwatch.Stop();
+            return Result<MongoToMssqlResult>.Failure(ex.Message);
+        }
+    }
+
+    /// <summary>
+    /// Stream MongoDB documents as JSON strings to a single-column table.
+    /// </summary>
+    private async Task TransferAsJsonWithCursorAsync(
+        IAsyncCursor<BsonDocument> cursor,
+        string mssqlConnectionString,
+        string targetTable,
+        MongoToMssqlOptions options,
+        MongoToMssqlResult result,
+        CancellationToken cancellationToken)
+    {
+        // Create async enumerator for all documents
+        async IAsyncEnumerable<BsonDocument> StreamAllDocuments()
+        {
+            // Yield documents from first batch
+            foreach (var doc in cursor.Current)
+            {
+                yield return doc;
+            }
+
+            // Stream remaining batches
+            while (await cursor.MoveNextAsync(cancellationToken))
+            {
+                foreach (var doc in cursor.Current)
+                {
+                    yield return doc;
+                }
+            }
+        }
+
+        // Create JSON data reader (single column: JsonData)
+        var columns = new List<string> { "JsonData" };
+        var columnTypes = new Dictionary<string, Type> { { "JsonData", typeof(string) } };
+
+        // Convert document to JSON string
+        Dictionary<string, object?> ConvertToJson(BsonDocument doc)
+        {
+            // Convert to relaxed JSON (more readable format)
+            var jsonSettings = new MongoDB.Bson.IO.JsonWriterSettings 
+            { 
+                OutputMode = MongoDB.Bson.IO.JsonOutputMode.RelaxedExtendedJson 
+            };
+            var jsonString = doc.ToJson(jsonSettings);
+            return new Dictionary<string, object?> { { "JsonData", jsonString } };
+        }
+
+        // Create streaming data reader
+        var enumerator = StreamAllDocuments().GetAsyncEnumerator(cancellationToken);
+        await using var jsonReader = new BsonDocumentDataReader(
+            enumerator,
+            columns,
+            columnTypes,
+            ConvertToJson,
+            null,
+            null);
+
+        // Connect to MSSQL
+        await using var connection = new SqlConnection(mssqlConnectionString);
+        await connection.OpenAsync(cancellationToken);
+
+        SqlTransaction? transaction = null;
+        if (options.UseTransaction)
+        {
+            transaction = connection.BeginTransaction();
+        }
+
+        try
+        {
+            var safeTableName = SqlValidator.SafeTableName(targetTable);
+
+            // Create single-column JSON table if not exists
+            await CreateJsonTableIfNotExistsAsync(connection, transaction, targetTable, options.Timeout, cancellationToken);
+            result.Warnings.Add($"JSON table '{targetTable}' created or verified");
+
+            // Truncate if needed
+            if (options.TruncateTargetTable)
+            {
+                await using var truncateCmd = new SqlCommand($"TRUNCATE TABLE {safeTableName}", connection, transaction);
+                truncateCmd.CommandTimeout = options.Timeout;
+                await truncateCmd.ExecuteNonQueryAsync(cancellationToken);
+                result.Warnings.Add($"Table '{targetTable}' truncated");
+            }
+
+            // Bulk copy with streaming
+            using var bulkCopy = new SqlBulkCopy(connection, SqlBulkCopyOptions.Default, transaction)
+            {
+                DestinationTableName = safeTableName,
+                BatchSize = options.BatchSize,
+                BulkCopyTimeout = options.Timeout,
+                EnableStreaming = true
+            };
+
+            bulkCopy.ColumnMappings.Add("JsonData", "JsonData");
+
+            // Stream data from MongoDB to SQL Server
+            await bulkCopy.WriteToServerAsync(jsonReader, cancellationToken);
+
+            result.TotalDocumentsRead = (int)jsonReader.RowCount;
+            result.TotalRowsWritten = (int)jsonReader.RowCount;
+            result.FailedDocuments = jsonReader.FailedCount;
+
+            // Commit transaction
+            if (transaction != null)
+            {
+                await transaction.CommitAsync(cancellationToken);
+            }
+        }
+        catch
+        {
+            if (transaction != null)
+            {
+                await transaction.RollbackAsync(cancellationToken);
+            }
+            throw;
+        }
+    }
+
+    /// <summary>
+    /// Creates a single-column JSON table if it doesn't exist.
+    /// Schema: Id (BIGINT IDENTITY), JsonData (NVARCHAR(MAX)), CreatedAt (DATETIME)
+    /// </summary>
+    private async Task CreateJsonTableIfNotExistsAsync(
+        SqlConnection connection,
+        SqlTransaction? transaction,
+        string tableName,
+        int timeout,
+        CancellationToken cancellationToken)
+    {
+        var safeTableName = SqlValidator.SafeTableName(tableName);
+        var tableNameOnly = tableName.Contains('.') ? tableName.Split('.')[1] : tableName;
+
+        var sql = $@"
+IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = @tableName)
+BEGIN
+    CREATE TABLE {safeTableName} (
+        Id BIGINT IDENTITY(1,1) PRIMARY KEY,
+        JsonData NVARCHAR(MAX) NOT NULL,
+        CreatedAt DATETIME DEFAULT GETUTCDATE()
+    )
+END";
+
+        await using var cmd = new SqlCommand(sql, connection, transaction);
+        cmd.Parameters.AddWithValue("@tableName", tableNameOnly);
+        cmd.CommandTimeout = timeout;
+        await cmd.ExecuteNonQueryAsync(cancellationToken);
+    }
 }

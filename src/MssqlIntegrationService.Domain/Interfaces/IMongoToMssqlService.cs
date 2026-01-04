@@ -49,4 +49,27 @@ public interface IMongoToMssqlService
         string targetTable,
         MongoToMssqlOptions? options = null,
         CancellationToken cancellationToken = default);
+
+    /// <summary>
+    /// Transfer data from MongoDB collection to MSSQL as raw JSON.
+    /// Creates a single-column table (TableName_JSON) with NVARCHAR(MAX) column.
+    /// Each document is stored as a JSON string for later parsing with OPENJSON in MSSQL.
+    /// </summary>
+    /// <param name="mongoConnectionString">MongoDB connection string</param>
+    /// <param name="mongoDatabaseName">MongoDB database name</param>
+    /// <param name="mongoCollection">MongoDB collection name</param>
+    /// <param name="mongoFilter">MongoDB filter (JSON format, empty for all documents)</param>
+    /// <param name="mssqlConnectionString">MSSQL connection string</param>
+    /// <param name="targetTable">Target MSSQL table name (will be suffixed with _JSON)</param>
+    /// <param name="options">Transfer options</param>
+    /// <param name="cancellationToken">Cancellation token</param>
+    Task<Result<MongoToMssqlResult>> TransferAsJsonAsync(
+        string mongoConnectionString,
+        string mongoDatabaseName,
+        string mongoCollection,
+        string? mongoFilter,
+        string mssqlConnectionString,
+        string targetTable,
+        MongoToMssqlOptions? options = null,
+        CancellationToken cancellationToken = default);
 }

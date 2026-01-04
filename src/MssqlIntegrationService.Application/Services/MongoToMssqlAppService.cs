@@ -102,4 +102,59 @@ public class MongoToMssqlAppService : IMongoToMssqlAppService
             ErrorMessage = result.ErrorMessage
         };
     }
+
+    public async Task<MongoToMssqlResponse> TransferAsJsonAsync(MongoToMssqlRequest request, CancellationToken cancellationToken = default)
+    {
+        // ===== VALIDATION =====
+        if (!SqlValidator.IsValidTableName(request.Target.TableName))
+        {
+            return new MongoToMssqlResponse
+            {
+                Success = false,
+                ErrorMessage = $"Invalid target table name: '{request.Target.TableName}'"
+            };
+        }
+        // ===== END VALIDATION =====
+
+        var options = request.Options != null
+            ? new MongoToMssqlOptions
+            {
+                BatchSize = request.Options.BatchSize,
+                Timeout = request.Options.Timeout,
+                TruncateTargetTable = request.Options.TruncateTargetTable,
+                UseTransaction = request.Options.UseTransaction
+            }
+            : null;
+
+        var result = await _mongoToMssqlService.TransferAsJsonAsync(
+            request.Source.ConnectionString,
+            request.Source.DatabaseName,
+            request.Source.CollectionName,
+            request.Source.Filter,
+            request.Target.ConnectionString,
+            request.Target.TableName,
+            options,
+            cancellationToken);
+
+        if (result.IsSuccess && result.Data != null)
+        {
+            return new MongoToMssqlResponse
+            {
+                Success = true,
+                SourceCollection = result.Data.SourceCollection,
+                TargetTable = result.Data.TargetTable,
+                TotalDocumentsRead = result.Data.TotalDocumentsRead,
+                TotalRowsWritten = result.Data.TotalRowsWritten,
+                FailedDocuments = result.Data.FailedDocuments,
+                ExecutionTimeMs = result.Data.ExecutionTimeMs,
+                Warnings = result.Data.Warnings
+            };
+        }
+
+        return new MongoToMssqlResponse
+        {
+            Success = false,
+            ErrorMessage = result.ErrorMessage
+        };
+    }
 }

@@ -91,4 +91,69 @@ public class MongoToMssqlController : ControllerBase
 
         return Ok(response);
     }
+
+    /// <summary>
+    /// Transfer MongoDB documents as raw JSON strings to a single-column MSSQL table.
+    /// </summary>
+    /// <remarks>
+    /// Creates a table with suffix _JSON containing:
+    /// - Id (BIGINT IDENTITY) - Auto-increment primary key
+    /// - JsonData (NVARCHAR(MAX)) - Raw JSON document
+    /// - CreatedAt (DATETIME2) - Insert timestamp
+    /// 
+    /// Use OPENJSON in MSSQL to parse the JSON later:
+    /// ```sql
+    /// SELECT j.*
+    /// FROM Users_JSON
+    /// CROSS APPLY OPENJSON(JsonData)
+    /// WITH (
+    ///     name NVARCHAR(100) '$.name',
+    ///     email NVARCHAR(200) '$.email',
+    ///     age INT '$.age'
+    /// ) AS j
+    /// ```
+    /// 
+    /// Example request:
+    /// ```json
+    /// {
+    ///   "source": {
+    ///     "connectionString": "mongodb://localhost:27017",
+    ///     "databaseName": "mydb",
+    ///     "collectionName": "users",
+    ///     "filter": "{ \"status\": \"active\" }"
+    ///   },
+    ///   "target": {
+    ///     "connectionString": "Server=...;Database=...;",
+    ///     "tableName": "Users"
+    ///   }
+    /// }
+    /// ```
+    /// This will create table "Users_JSON" with raw JSON documents.
+    /// </remarks>
+    [HttpPost("transfer-as-json")]
+    [ProducesResponseType(typeof(MongoToMssqlResponse), StatusCodes.Status200OK)]
+    [ProducesResponseType(typeof(MongoToMssqlResponse), StatusCodes.Status400BadRequest)]
+    public async Task<IActionResult> TransferAsJson([FromBody] MongoToMssqlRequest request, CancellationToken cancellationToken)
+    {
+        _logger.LogInformation(
+            "Starting MongoDB to MSSQL JSON transfer: {Collection} → {Table}_JSON",
+            request.Source.CollectionName,
+            request.Target.TableName);
+
+        var response = await _mongoToMssqlService.TransferAsJsonAsync(request, cancellationToken);
+
+        if (!response.Success)
+        {
+            _logger.LogWarning("MongoDB to MSSQL JSON transfer failed: {Error}", response.ErrorMessage);
+            return BadRequest(response);
+        }
+
+        _logger.LogInformation(
+            "JSON transfer completed: {DocsRead} documents read, {RowsWritten} rows written in {TimeMs}ms",
+            response.TotalDocumentsRead,
+            response.TotalRowsWritten,
+            response.ExecutionTimeMs);
+
+        return Ok(response);
+    }
 }

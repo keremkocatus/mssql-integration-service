@@ -11,7 +11,8 @@ A comprehensive MSSQL integration service built with .NET 9 and Clean Architectu
 - ✅ **Dynamic connection strings** (connect to any database per request)
 - ✅ **Data transfer between databases** (MSSQL to MSSQL)
 - ✅ **MongoDB to MSSQL transfer** (with aggregation pipeline support)
-- ✅ **Data sync** (Delete-Insert pattern)
+- ✅ **MongoDB to MSSQL as JSON** (raw JSON for OPENJSON parsing)
+- ✅ **Data sync** (Delete-Insert pattern with auto-index)
 - ✅ **Bulk insert** operations
 
 ### Performance & Efficiency
@@ -19,6 +20,7 @@ A comprehensive MSSQL integration service built with .NET 9 and Clean Architectu
 - ✅ **SqlBulkCopy with EnableStreaming** - Direct IDataReader streaming
 - ✅ **Cursor-based MongoDB reads** - Processes documents one at a time
 - ✅ **CommandBehavior.SequentialAccess** - Optimized for large columns
+- ✅ **Auto index copying** - Copies target table indexes to temp tables for faster sync
 
 ### Security
 - ✅ **SQL Injection protection** - All table/column names sanitized with `SafeTableName`/`SafeIdentifier`
@@ -45,7 +47,7 @@ src/
 └── MssqlIntegrationService.API/              # API layer (controllers, middleware)
 
 tests/
-└── MssqlIntegrationService.Tests/            # Unit tests (148 tests)
+└── MssqlIntegrationService.Tests/            # Unit tests (152 tests)
 ```
 
 ## 🏗️ Architecture
@@ -139,6 +141,7 @@ Swagger UI: `https://localhost:5001/swagger`
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | POST | `/api/mongotomssql/transfer` | Transfer data from MongoDB to MSSQL |
+| POST | `/api/mongotomssql/transfer-as-json` | Transfer as raw JSON (single column) |
 
 ### Static Query (Uses default connection)
 | Method | Endpoint | Description |
@@ -241,6 +244,12 @@ POST /api/datasync/sync
 - `deleteAllBeforeInsert`: If `true`, deletes ALL rows from target before insert (full refresh)
 - `columnMappings`: Map source columns to different target column names
 
+**Auto Index Copying:**
+DataSync automatically copies indexes from the target table to the temp table for faster DELETE/JOIN operations:
+- Primary Key → Non-clustered index
+- Unique indexes → Preserved as unique
+- Non-unique indexes → Copied with original column order (ASC/DESC)
+
 ### MongoDB to MSSQL Transfer 🍃➡️💾
 Transfer data from MongoDB collections to MSSQL tables with support for:
 - Filter-based queries
@@ -297,6 +306,53 @@ POST /api/mongotomssql/transfer
 - `includeFields`: Only transfer specified fields
 - `excludeFields`: Exclude specified fields
 - `fieldMappings`: Map MongoDB fields to MSSQL columns
+
+### MongoDB to MSSQL as Raw JSON 🍃➡️📄
+Transfer MongoDB documents as raw JSON strings to a single-column table. Useful when you want to parse the data later using `OPENJSON` in MSSQL.
+
+```json
+POST /api/mongotomssql/transfer-as-json
+{
+    "source": {
+        "connectionString": "mongodb://localhost:27017",
+        "databaseName": "mydb",
+        "collectionName": "users",
+        "filter": "{ \"status\": \"active\" }"
+    },
+    "target": {
+        "connectionString": "Server=myserver;Database=MyDB;...",
+        "tableName": "Users"
+    }
+}
+```
+
+This creates a table `Users_JSON` with schema:
+```sql
+CREATE TABLE Users_JSON (
+    Id BIGINT IDENTITY(1,1) PRIMARY KEY,
+    JsonData NVARCHAR(MAX) NOT NULL,
+    CreatedAt DATETIME DEFAULT GETUTCDATE()
+)
+```
+
+**Parse with OPENJSON:**
+```sql
+SELECT 
+    JSON_VALUE(JsonData, '$.name') AS Name,
+    JSON_VALUE(JsonData, '$.email') AS Email,
+    CAST(JSON_VALUE(JsonData, '$.age') AS INT) AS Age
+FROM Users_JSON
+
+-- Or with CROSS APPLY
+SELECT j.*
+FROM Users_JSON
+CROSS APPLY OPENJSON(JsonData)
+WITH (
+    name NVARCHAR(100) '$.name',
+    email NVARCHAR(200) '$.email',
+    age INT '$.age'
+) AS j
+```
 
 ### Get Database Info
 ```json
