@@ -588,13 +588,13 @@ docker build -t mssql-integration-service .
 docker run -d -p 5000:8080 --name mssql-service mssql-integration-service
 ```
 
-### Docker Compose (with SQL Server)
+### Docker Compose (with SQL Server & MongoDB)
 
 ```bash
-# Development (includes local SQL Server)
+# Development (includes local SQL Server + MongoDB for Job Processing)
 docker-compose up -d
 
-# Production (service only)
+# Production (service + MongoDB only)
 docker-compose -f docker-compose.prod.yml up -d
 ```
 
@@ -604,12 +604,16 @@ docker-compose -f docker-compose.prod.yml up -d
 |----------|-------------|---------|
 | `ASPNETCORE_ENVIRONMENT` | Environment (Development/Production) | Production |
 | `ConnectionStrings__DefaultConnection` | Default DB connection string | - |
+| `JobProcessing__MongoConnectionString` | MongoDB connection for jobs | mongodb://mongodb:27017 |
+| `JobProcessing__MongoDatabaseName` | MongoDB database name | MssqlIntegrationService |
+| `JobProcessing__CollectionName` | Jobs collection name | Jobs |
 
 ### Access Points
 
 - **API**: http://localhost:5000
 - **Swagger**: http://localhost:5000/swagger
 - **Health**: http://localhost:5000/api/health
+- **MongoDB**: localhost:27017 (development only)
 
 ### SQL Server Connection (from docker-compose)
 
@@ -620,7 +624,7 @@ Server=sqlserver;Database=master;User Id=sa;Password=YourStrong@Passw0rd;TrustSe
 ## 🧪 Running Tests
 
 ```bash
-# Run all tests (124 tests)
+# Run all tests (180 tests)
 dotnet test
 
 # Run with coverage

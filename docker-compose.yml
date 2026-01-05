@@ -9,11 +9,33 @@ services:
     environment:
       - ASPNETCORE_ENVIRONMENT=Development
       - ConnectionStrings__DefaultConnection=
+      - JobProcessing__MongoConnectionString=mongodb://mongodb:27017
+      - JobProcessing__MongoDatabaseName=MssqlIntegrationService
+      - JobProcessing__CollectionName=Jobs
     restart: unless-stopped
+    depends_on:
+      - mongodb
     networks:
       - mssql-network
     healthcheck:
       test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8080/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  # MongoDB for Job Processing
+  mongodb:
+    image: mongo:7.0
+    container_name: mongodb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb-data:/data/db
+    networks:
+      - mssql-network
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -46,3 +68,4 @@ networks:
 
 volumes:
   sqlserver-data:
+  mongodb-data:
