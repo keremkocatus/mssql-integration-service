@@ -14,6 +14,7 @@ A comprehensive MSSQL integration service built with .NET 9 and Clean Architectu
 - ✅ **MongoDB to MSSQL as JSON** (raw JSON for OPENJSON parsing)
 - ✅ **Data sync** (Delete-Insert pattern with auto-index)
 - ✅ **Bulk insert** operations
+- ✅ **Async job system** - Fire-and-forget with status polling (MongoDB-backed)
 
 ### Performance & Efficiency
 - ✅ **Memory-efficient streaming** - No full dataset loading into RAM
@@ -21,6 +22,7 @@ A comprehensive MSSQL integration service built with .NET 9 and Clean Architectu
 - ✅ **Cursor-based MongoDB reads** - Processes documents one at a time
 - ✅ **CommandBehavior.SequentialAccess** - Optimized for large columns
 - ✅ **Auto index copying** - Copies target table indexes to temp tables for faster sync
+- ✅ **Async job processing** - Background processing with status polling (no HTTP timeout)
 
 ### Security
 - ✅ **SQL Injection protection** - All table/column names sanitized with `SafeTableName`/`SafeIdentifier`
@@ -47,7 +49,7 @@ src/
 └── MssqlIntegrationService.API/              # API layer (controllers, middleware)
 
 tests/
-└── MssqlIntegrationService.Tests/            # Unit tests (152 tests)
+└── MssqlIntegrationService.Tests/            # Unit tests (177+ tests)
 ```
 
 ## 🏗️ Architecture
@@ -63,7 +65,7 @@ This project follows **Clean Architecture** principles:
 │           (DTOs, App Services, Interfaces)                   │
 ├─────────────────────────────────────────────────────────────┤
 │                 Infrastructure Layer                         │
-│    (Database Services, Streaming DataReaders, Logging)       │
+│    (Database Services, Streaming DataReaders, Job Queue)     │
 ├─────────────────────────────────────────────────────────────┤
 │                    Domain Layer                              │
 │       (Entities, Interfaces, Validation, Exceptions)         │
@@ -149,6 +151,16 @@ Swagger UI: `https://localhost:5001/swagger`
 | POST | `/api/query/execute` | Execute SELECT query |
 | POST | `/api/query/execute-nonquery` | Execute INSERT/UPDATE/DELETE |
 | POST | `/api/query/execute-sp` | Execute stored procedure |
+
+### Async Jobs (Background Processing) 🔄
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/jobs/data-transfer` | Start async data transfer job |
+| POST | `/api/jobs/data-sync` | Start async data sync job |
+| POST | `/api/jobs/mongo-to-mssql` | Start async MongoDB transfer job |
+| GET | `/api/jobs/{jobId}` | Get job status by ID |
+| GET | `/api/jobs` | List recent jobs (default: 20) |
+| POST | `/api/jobs/{jobId}/cancel` | Cancel a pending/running job |
 
 ## 📝 Usage Examples
 
@@ -364,6 +376,155 @@ POST /api/dynamicquery/database-info
 }
 ```
 
+### Async Job Processing 🔄
+For long-running ETL operations that may timeout, use the async job system. Jobs are processed in the background while you poll for status.
+
+**Start an async data transfer job:**
+```json
+POST /api/jobs/data-transfer
+{
+    "source": {
+        "connectionString": "Server=source-server;Database=SourceDB;...",
+        "query": "SELECT * FROM LargeTable"
+    },
+    "target": {
+        "connectionString": "Server=target-server;Database=TargetDB;...",
+        "tableName": "LargeTable"
+    },
+    "options": {
+        "batchSize": 5000,
+        "createTableIfNotExists": true
+    },
+    "useBulkInsert": false
+}
+```
+
+**Response (202 Accepted):**
+```json
+{
+    "jobId": "550e8400-e29b-41d4-a716-446655440000",
+    "status": "Pending",
+    "estimatedStartTime": "2025-01-15T10:30:05Z"
+}
+```
+
+**Poll for job status:**
+```json
+GET /api/jobs/550e8400-e29b-41d4-a716-446655440000
+
+// Response (Running)
+{
+    "jobId": "550e8400-e29b-41d4-a716-446655440000",
+    "type": "DataTransfer",
+    "status": "Running",
+    "progress": 45,
+    "progressMessage": "Processing batch 9000 of 20000",
+    "createdAt": "2025-01-15T10:30:00Z",
+    "startedAt": "2025-01-15T10:30:05Z"
+}
+
+// Response (Completed)
+{
+    "jobId": "550e8400-e29b-41d4-a716-446655440000",
+    "type": "DataTransfer",
+    "status": "Completed",
+    "progress": 100,
+    "result": {
+        "totalRowsRead": 20000,
+        "totalRowsWritten": 20000,
+        "executionTimeMs": 15234
+    },
+    "createdAt": "2025-01-15T10:30:00Z",
+    "startedAt": "2025-01-15T10:30:05Z",
+    "completedAt": "2025-01-15T10:30:20Z"
+}
+
+// Response (Failed)
+{
+    "jobId": "550e8400-e29b-41d4-a716-446655440000",
+    "type": "DataTransfer",
+    "status": "Failed",
+    "errorMessage": "Connection timeout after 30 seconds",
+    "createdAt": "2025-01-15T10:30:00Z",
+    "startedAt": "2025-01-15T10:30:05Z",
+    "completedAt": "2025-01-15T10:30:35Z"
+}
+```
+
+**Async DataSync job:**
+```json
+POST /api/jobs/data-sync
+{
+    "source": {
+        "connectionString": "Server=source-server;...",
+        "query": "SELECT * FROM Products"
+    },
+    "target": {
+        "connectionString": "Server=target-server;...",
+        "tableName": "Products",
+        "keyColumns": ["ProductId"]
+    },
+    "options": {
+        "batchSize": 1000,
+        "useTransaction": true
+    }
+}
+```
+
+**Async MongoDB to MSSQL job:**
+```json
+POST /api/jobs/mongo-to-mssql
+{
+    "source": {
+        "connectionString": "mongodb://localhost:27017",
+        "databaseName": "mydb",
+        "collectionName": "users"
+    },
+    "target": {
+        "connectionString": "Server=myserver;...",
+        "tableName": "Users"
+    },
+    "options": {
+        "batchSize": 1000,
+        "createTableIfNotExists": true
+    },
+    "transferAsJson": false
+}
+```
+
+**List recent jobs:**
+```json
+GET /api/jobs?limit=50
+
+// Response
+[
+    {
+        "jobId": "...",
+        "type": "DataTransfer",
+        "status": "Completed",
+        "createdAt": "2025-01-15T10:30:00Z"
+    },
+    {
+        "jobId": "...",
+        "type": "MongoToMssql",
+        "status": "Running",
+        "progress": 67,
+        "createdAt": "2025-01-15T10:35:00Z"
+    }
+]
+```
+
+**Cancel a job:**
+```json
+POST /api/jobs/550e8400-e29b-41d4-a716-446655440000/cancel
+
+// Response (Success)
+{
+    "message": "Job cancelled successfully",
+    "jobId": "550e8400-e29b-41d4-a716-446655440000"
+}
+```
+
 ## 🔧 Configuration
 
 ### appsettings.json
@@ -393,6 +554,11 @@ POST /api/dynamicquery/database-info
       "DatabaseName": "MssqlIntegrationService",
       "CollectionName": "RequestLogs"
     }
+  },
+  "JobProcessing": {
+    "MongoConnectionString": "mongodb://localhost:27017",
+    "MongoDatabaseName": "MssqlIntegrationService",
+    "CollectionName": "Jobs"
   }
 }
 ```

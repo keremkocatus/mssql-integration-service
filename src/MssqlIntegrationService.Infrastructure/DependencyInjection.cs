@@ -1,5 +1,6 @@
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.DependencyInjection;
+using MongoDB.Driver;
 using MssqlIntegrationService.Application.Interfaces;
 using MssqlIntegrationService.Application.Services;
 using MssqlIntegrationService.Domain.Interfaces;
@@ -37,6 +38,43 @@ public static class DependencyInjection
         // MongoDB to MSSQL services
         services.AddScoped<IMongoToMssqlService, MongoToMssqlService>();
         services.AddScoped<IMongoToMssqlAppService, MongoToMssqlAppService>();
+
+        return services;
+    }
+
+    /// <summary>
+    /// Adds background job processing services
+    /// </summary>
+    public static IServiceCollection AddJobProcessing(this IServiceCollection services, IConfiguration configuration)
+    {
+        // Get MongoDB settings for job storage
+        var jobSettings = configuration.GetSection("JobProcessing");
+        var mongoConnectionString = jobSettings["MongoConnectionString"] ?? "mongodb://localhost:27017";
+        var mongoDatabaseName = jobSettings["MongoDatabaseName"] ?? "MssqlIntegrationService";
+        var collectionName = jobSettings["CollectionName"] ?? "Jobs";
+
+        // Register MongoDB for job storage
+        services.AddSingleton<IMongoClient>(_ => new MongoClient(mongoConnectionString));
+        services.AddSingleton(sp =>
+        {
+            var client = sp.GetRequiredService<IMongoClient>();
+            return client.GetDatabase(mongoDatabaseName);
+        });
+
+        // Register job repository
+        services.AddSingleton<IJobRepository>(sp =>
+        {
+            var database = sp.GetRequiredService<IMongoDatabase>();
+            return new MongoJobRepository(database, collectionName);
+        });
+
+        // Register background job processor (singleton - hosted service)
+        services.AddSingleton<BackgroundJobProcessor>();
+        services.AddSingleton<IJobQueueService>(sp => sp.GetRequiredService<BackgroundJobProcessor>());
+        services.AddHostedService(sp => sp.GetRequiredService<BackgroundJobProcessor>());
+
+        // Register job app service
+        services.AddScoped<IJobAppService, JobAppService>();
 
         return services;
     }

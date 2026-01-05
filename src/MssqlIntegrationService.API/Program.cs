@@ -8,11 +8,14 @@ builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(c =>
 {
-    c.SwaggerDoc("v1", new() { Title = "MSSQL Generic Service API", Version = "v1" });
+    c.SwaggerDoc("v1", new() { Title = "MSSQL Integration Service API", Version = "v1" });
 });
 
 // Add Infrastructure services (Database, etc.)
 builder.Services.AddInfrastructure(builder.Configuration);
+
+// Add Background Job Processing services
+builder.Services.AddJobProcessing(builder.Configuration);
 
 // Add Request Logging services
 builder.Services.AddRequestLogging(builder.Configuration);
