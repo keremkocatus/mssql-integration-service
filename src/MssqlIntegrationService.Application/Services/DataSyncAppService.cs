@@ -9,18 +9,61 @@ namespace MssqlIntegrationService.Application.Services;
 public class DataSyncAppService : IDataSyncAppService
 {
     private readonly IDataSyncService _dataSyncService;
+    private readonly ISchemaService _schemaService;
 
-    public DataSyncAppService(IDataSyncService dataSyncService)
+    public DataSyncAppService(IDataSyncService dataSyncService, ISchemaService schemaService)
     {
         _dataSyncService = dataSyncService;
+        _schemaService = schemaService;
     }
 
     public async Task<DataSyncResponse> SyncDataAsync(DataSyncRequest request, CancellationToken cancellationToken = default)
     {
+        // ===== AUTO-DETECT KEY COLUMNS IF NOT PROVIDED =====
+        List<string> keyColumns;
+        bool keyColumnsAutoDetected = false;
+        string? keyColumnsSource = null;
+
+        if (request.Target.KeyColumns == null || request.Target.KeyColumns.Count == 0)
+        {
+            // Skip auto-detection if DeleteAllBeforeInsert is true (key columns not needed)
+            if (request.Options?.DeleteAllBeforeInsert == true)
+            {
+                keyColumns = new List<string>(); // Empty list, won't be used
+            }
+            else
+            {
+                // Auto-detect from target table schema using SchemaService
+                var keyColumnsResult = await _schemaService.GetKeyColumnsAsync(
+                    request.Target.ConnectionString,
+                    request.Target.TableName,
+                    cancellationToken);
+
+                if (!keyColumnsResult.IsSuccess || keyColumnsResult.Data == null || keyColumnsResult.Data.Count == 0)
+                {
+                    return new DataSyncResponse
+                    {
+                        Success = false,
+                        ErrorMessage = keyColumnsResult.ErrorMessage ?? 
+                            $"Could not auto-detect key columns for table '{request.Target.TableName}'. " +
+                            "Please provide KeyColumns manually or ensure the target table has a Primary Key or Unique Index."
+                    };
+                }
+
+                keyColumns = keyColumnsResult.Data;
+                keyColumnsAutoDetected = true;
+                keyColumnsSource = "auto-detected from schema";
+            }
+        }
+        else
+        {
+            keyColumns = request.Target.KeyColumns;
+        }
+
         // ===== SQL INJECTION VALIDATION =====
         var validation = SqlValidator.Validate(
             tableName: request.Target.TableName,
-            columnNames: request.Target.KeyColumns
+            columnNames: keyColumns
         );
 
         if (!validation.IsValid)
@@ -65,13 +108,13 @@ public class DataSyncAppService : IDataSyncAppService
             request.Target.ConnectionString,
             request.Source.Query,
             request.Target.TableName,
-            request.Target.KeyColumns,
+            keyColumns,
             options,
             cancellationToken);
 
         if (result.IsSuccess && result.Data != null)
         {
-            return new DataSyncResponse
+            var response = new DataSyncResponse
             {
                 Success = true,
                 TotalRowsRead = result.Data.TotalRowsRead,
@@ -81,8 +124,16 @@ public class DataSyncAppService : IDataSyncAppService
                 SourceQuery = result.Data.SourceQuery,
                 TargetTable = result.Data.TargetTable,
                 KeyColumns = result.Data.KeyColumns,
-                Warnings = result.Data.Warnings
+                Warnings = result.Data.Warnings ?? new List<string>()
             };
+
+            // Add info about auto-detected key columns
+            if (keyColumnsAutoDetected)
+            {
+                response.Warnings!.Insert(0, $"KeyColumns {keyColumnsSource}: [{string.Join(", ", keyColumns)}]");
+            }
+
+            return response;
         }
 
         return new DataSyncResponse

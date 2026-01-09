@@ -59,10 +59,14 @@ public class DataSyncController : ControllerBase
     [ProducesResponseType(typeof(DataSyncResponse), StatusCodes.Status400BadRequest)]
     public async Task<IActionResult> SyncData([FromBody] DataSyncRequest request, CancellationToken cancellationToken)
     {
+        var keyColumnsInfo = request.Target.KeyColumns != null && request.Target.KeyColumns.Count > 0
+            ? string.Join(", ", request.Target.KeyColumns)
+            : "(auto-detect from schema)";
+
         _logger.LogInformation(
             "Starting data sync from source to {TargetTable} with keys: {KeyColumns}",
             request.Target.TableName,
-            string.Join(", ", request.Target.KeyColumns));
+            keyColumnsInfo);
 
         var response = await _dataSyncService.SyncDataAsync(request, cancellationToken);
 

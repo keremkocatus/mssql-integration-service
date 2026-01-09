@@ -11,12 +11,14 @@ namespace MssqlIntegrationService.Tests.Application;
 public class DataSyncAppServiceTests
 {
     private readonly Mock<IDataSyncService> _mockSyncService;
+    private readonly Mock<ISchemaService> _mockSchemaService;
     private readonly DataSyncAppService _service;
 
     public DataSyncAppServiceTests()
     {
         _mockSyncService = new Mock<IDataSyncService>();
-        _service = new DataSyncAppService(_mockSyncService.Object);
+        _mockSchemaService = new Mock<ISchemaService>();
+        _service = new DataSyncAppService(_mockSyncService.Object, _mockSchemaService.Object);
     }
 
     [Fact]
@@ -228,5 +230,157 @@ public class DataSyncAppServiceTests
 
         // Assert
         response.Success.Should().BeTrue();
+    }
+
+    [Fact]
+    public async Task SyncDataAsync_WithoutKeyColumns_AutoDetectsFromSchema()
+    {
+        // Arrange
+        var request = new DataSyncRequest
+        {
+            Source = new SyncSourceConfig
+            {
+                ConnectionString = "Server=source;",
+                Query = "SELECT * FROM Users"
+            },
+            Target = new SyncTargetConfig
+            {
+                ConnectionString = "Server=target;",
+                TableName = "Users",
+                KeyColumns = null // No key columns provided
+            }
+        };
+
+        var autoDetectedKeyColumns = new List<string> { "Id", "Code" };
+
+        _mockSchemaService
+            .Setup(x => x.GetKeyColumnsAsync(
+                request.Target.ConnectionString,
+                request.Target.TableName,
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Result<List<string>>.Success(autoDetectedKeyColumns));
+
+        var syncResult = new SyncResult
+        {
+            TotalRowsRead = 100,
+            RowsDeleted = 50,
+            RowsInserted = 100,
+            KeyColumns = autoDetectedKeyColumns,
+            Warnings = new List<string>()
+        };
+
+        _mockSyncService
+            .Setup(x => x.SyncDataAsync(
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                autoDetectedKeyColumns,
+                It.IsAny<SyncOptions>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Result<SyncResult>.Success(syncResult));
+
+        // Act
+        var response = await _service.SyncDataAsync(request);
+
+        // Assert
+        response.Success.Should().BeTrue();
+        response.KeyColumns.Should().Contain("Id");
+        response.KeyColumns.Should().Contain("Code");
+        response.Warnings.Should().Contain(w => w.Contains("auto-detected"));
+        
+        _mockSchemaService.Verify(x => x.GetKeyColumnsAsync(
+            request.Target.ConnectionString,
+            request.Target.TableName,
+            It.IsAny<CancellationToken>()), Times.Once);
+    }
+
+    [Fact]
+    public async Task SyncDataAsync_WithoutKeyColumns_SchemaServiceFails_ReturnsError()
+    {
+        // Arrange
+        var request = new DataSyncRequest
+        {
+            Source = new SyncSourceConfig
+            {
+                ConnectionString = "Server=source;",
+                Query = "SELECT * FROM Users"
+            },
+            Target = new SyncTargetConfig
+            {
+                ConnectionString = "Server=target;",
+                TableName = "TableWithoutPK",
+                KeyColumns = null
+            }
+        };
+
+        _mockSchemaService
+            .Setup(x => x.GetKeyColumnsAsync(
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Result<List<string>>.Failure("No Primary Key or Unique Index found"));
+
+        // Act
+        var response = await _service.SyncDataAsync(request);
+
+        // Assert
+        response.Success.Should().BeFalse();
+        response.ErrorMessage.Should().Contain("Primary Key");
+    }
+
+    [Fact]
+    public async Task SyncDataAsync_WithDeleteAllAndNoKeyColumns_SkipsAutoDetection()
+    {
+        // Arrange
+        var request = new DataSyncRequest
+        {
+            Source = new SyncSourceConfig
+            {
+                ConnectionString = "Server=source;",
+                Query = "SELECT * FROM Users"
+            },
+            Target = new SyncTargetConfig
+            {
+                ConnectionString = "Server=target;",
+                TableName = "Users",
+                KeyColumns = null // No key columns
+            },
+            Options = new SyncOptionsDto
+            {
+                DeleteAllBeforeInsert = true // Key columns not needed
+            }
+        };
+
+        var syncResult = new SyncResult
+        {
+            TotalRowsRead = 100,
+            RowsDeleted = 1000,
+            RowsInserted = 100,
+            Warnings = new List<string>()
+        };
+
+        _mockSyncService
+            .Setup(x => x.SyncDataAsync(
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<string>(),
+                It.IsAny<List<string>>(),
+                It.Is<SyncOptions>(o => o.DeleteAllBeforeInsert == true),
+                It.IsAny<CancellationToken>()))
+            .ReturnsAsync(Result<SyncResult>.Success(syncResult));
+
+        // Act
+        var response = await _service.SyncDataAsync(request);
+
+        // Assert
+        response.Success.Should().BeTrue();
+        
+        // SchemaService should NOT be called when DeleteAllBeforeInsert is true
+        _mockSchemaService.Verify(x => x.GetKeyColumnsAsync(
+            It.IsAny<string>(),
+            It.IsAny<string>(),
+            It.IsAny<CancellationToken>()), Times.Never);
     }
 }

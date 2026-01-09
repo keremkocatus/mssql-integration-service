@@ -12,7 +12,7 @@ A comprehensive MSSQL integration service built with .NET 9 and Clean Architectu
 - ✅ **Data transfer between databases** (MSSQL to MSSQL)
 - ✅ **MongoDB to MSSQL transfer** (with aggregation pipeline support)
 - ✅ **MongoDB to MSSQL as JSON** (raw JSON for OPENJSON parsing)
-- ✅ **Data sync** (Delete-Insert pattern with auto-index)
+- ✅ **Data sync** (Delete-Insert pattern with auto-index & auto key detection)
 - ✅ **Bulk insert** operations
 - ✅ **Async job system** - Fire-and-forget with status polling (MongoDB-backed)
 
@@ -49,7 +49,7 @@ src/
 └── MssqlIntegrationService.API/              # API layer (controllers, middleware)
 
 tests/
-└── MssqlIntegrationService.Tests/            # Unit tests (177+ tests)
+└── MssqlIntegrationService.Tests/            # Unit tests (183+ tests)
 ```
 
 ## 🏗️ Architecture
@@ -240,8 +240,7 @@ POST /api/datasync/sync
     },
     "target": {
         "connectionString": "Server=target-server;Database=TargetDB;User Id=sa;Password=xxx;TrustServerCertificate=true;",
-        "tableName": "Users",
-        "keyColumns": ["Id"]
+        "tableName": "Users"
     },
     "options": {
         "batchSize": 1000,
@@ -252,9 +251,15 @@ POST /api/datasync/sync
 ```
 
 **Options:**
-- `keyColumns`: Columns used to match records for deletion (e.g., `["Id"]` or `["CustomerId", "OrderId"]`)
+- `keyColumns`: *(optional)* Columns used to match records for deletion (e.g., `["Id"]` or `["CustomerId", "OrderId"]`). If not provided, auto-detected from target table schema.
 - `deleteAllBeforeInsert`: If `true`, deletes ALL rows from target before insert (full refresh)
 - `columnMappings`: Map source columns to different target column names
+
+**Auto Key Detection:** 🆕
+If `keyColumns` is not provided, the system automatically detects key columns from the target table:
+1. **Primary Key** columns (first priority)
+2. **First Unique Index** columns (if no PK exists)
+3. Returns error if neither exists (must provide `keyColumns` manually)
 
 **Auto Index Copying:**
 DataSync automatically copies indexes from the target table to the temp table for faster DELETE/JOIN operations:

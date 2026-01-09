@@ -32,6 +32,7 @@ public static class DependencyInjection
         services.AddScoped<IDataTransferAppService, DataTransferAppService>();
 
         // Data sync services (delete-insert pattern)
+        services.AddScoped<ISchemaService, SchemaService>();
         services.AddScoped<IDataSyncService, DataSyncService>();
         services.AddScoped<IDataSyncAppService, DataSyncAppService>();
 

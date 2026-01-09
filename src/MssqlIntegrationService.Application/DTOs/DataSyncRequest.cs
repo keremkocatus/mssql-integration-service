@@ -44,10 +44,11 @@ public class SyncTargetConfig
     public required string TableName { get; set; }
     
     /// <summary>
-    /// Key columns used for matching records to delete
-    /// These columns will be used in JOIN condition
+    /// Key columns used for matching records to delete.
+    /// These columns will be used in JOIN condition.
+    /// If not provided, Primary Key or Unique Index columns will be auto-detected from target table schema.
     /// </summary>
-    public required List<string> KeyColumns { get; set; }
+    public List<string>? KeyColumns { get; set; }
 }
 
 public class SyncOptionsDto
