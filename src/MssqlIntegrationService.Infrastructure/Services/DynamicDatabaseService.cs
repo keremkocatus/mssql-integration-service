@@ -241,7 +241,7 @@ public class DynamicDatabaseService : IDynamicDatabaseService
                 SELECT 
                     s.name AS SchemaName,
                     t.name AS TableName,
-                    p.rows AS RowCount
+                    p.rows AS [RowCount]
                 FROM sys.tables t
                 INNER JOIN sys.schemas s ON t.schema_id = s.schema_id
                 INNER JOIN sys.partitions p ON t.object_id = p.object_id AND p.index_id IN (0, 1)
@@ -268,7 +268,7 @@ public class DynamicDatabaseService : IDynamicDatabaseService
                     t.name AS DataType,
                     c.max_length AS MaxLength,
                     c.is_nullable AS IsNullable,
-                    ISNULL(i.is_primary_key, 0) AS IsPrimaryKey,
+                    CAST(ISNULL(i.is_primary_key, 0) AS INT) AS IsPrimaryKey,
                     c.is_identity AS IsIdentity
                 FROM sys.columns c
                 INNER JOIN sys.types t ON c.user_type_id = t.user_type_id
